@@ -1,0 +1,27 @@
+# Virtual environment — never commit this (large, machine-specific)
+.venv/
+venv/
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets & local env — keep credentials off GitHub
+.env
+.env.*
+*.local
+secrets.*
+
+# Local session notes written by the SessionEnd hook (may contain conversation
+# content). Remove this line if you WANT to sync session notes via GitHub.
+sessions/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \".claude\\hooks\\session-start-context.ps1\"",
+            "timeout": 20,
+            "statusMessage": "Loading last session notes..."
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \".claude\\hooks\\session-end-summary.ps1\"",
+            "timeout": 60,
+            "statusMessage": "Saving session summary..."
+          }
+        ]
+      }
+    ]
+  }
+}
