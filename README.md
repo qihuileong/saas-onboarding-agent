@@ -104,7 +104,7 @@ uv run python main.py --url <docs-url>
 uv run python -c "from agent import onboard; print(onboard('https://petstore3.swagger.io/api/v3/openapi.json').model_dump_json(indent=2))"
 ```
 
-Inside the interactive agent, a message containing a URL starts a fresh onboarding; asking it to *"summarize / understand the endpoints"* auto-runs structured extraction and prints an `ApiSpec`.
+Inside the interactive agent, a message containing a URL runs the OpenAPI-first `onboard()` router automatically — it finds and parses a spec (or falls back to scraping), prints the structured `ApiSpec`, and hands those endpoints to the agent as ground truth. From there, ask it to *"test the list endpoint"* and it makes a real, grounded call.
 
 ---
 
@@ -126,13 +126,12 @@ Inside the interactive agent, a message containing a URL starts a fresh onboardi
 
 Scoping is deliberate — this is a bootstrapping accelerator and portfolio piece, **not** a production tool.
 
-- **`onboard()` isn't wired into the interactive REPL yet.** The OpenAPI-first router is built and validated, but the REPL currently drives the agentic + extraction lane; unifying them is the next step.
 - **JSON specs only.** YAML OpenAPI specs fall through to scraping (a `pyyaml` parse is the fix).
 - **Context window.** Very large doc sets are front-truncated before extraction; the real fix is chunk-summarization or a vector store (RAG) over the corpus — the "if this were production" answer.
 - **Scrape-fallback is noisy** on sprawling, hypermedia-heavy docs (e.g. GitHub). OpenAPI is the clean lane; noisy fallback is an accepted, honest trade-off.
 - **Real third-party `200`s** are proven on public/no-auth endpoints; the secret-handling path is validated against `httpbingo.org/bearer`.
 
-**What I'd build next:** wire `onboard()` into the loop → intent-based endpoint matching (embeddings) → a Streamlit UI (the genuinely hard part is mapping the `interrupt()` auth handoff onto Streamlit's top-to-bottom reruns) → code-snippet generation built from *actual tool results*, never the model's free text.
+**What I'd build next:** intent-based endpoint matching (describe a goal → match it against the clean endpoint list via embeddings) → a Streamlit UI (the genuinely hard part is mapping the `interrupt()` auth handoff onto Streamlit's top-to-bottom reruns) → code-snippet generation built from *actual tool results*, never the model's free text.
 
 ---
 

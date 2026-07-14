@@ -263,13 +263,27 @@ def onboard(url: str) -> ApiSpec:
     """OpenAPI-first: clean parse if a spec exists, else fall back to the scraper."""
     spec_url = find_openapi_spec(url)
     if spec_url:
-        print(f"✓ Found OpenAPI spec: {spec_url} — using clean parse.")
+        print(f"[ok] Found OpenAPI spec: {spec_url} - using clean parse.")
         return parse_openapi(spec_url)
-    print("✗ No OpenAPI spec found — falling back to doc scraping.")
+    print("[--] No OpenAPI spec found - falling back to doc scraping.")
     return extract_from_pages(crawl(url))
 
+def _first_url(text: str) -> str:
+    """Pull the first URL out of a user message (onboard() needs a bare URL)."""
+    m = re.search(r"https?://\S+", text)
+    return m.group(0).rstrip(".,);") if m else text.strip()
+
 if __name__ == "__main__":
+    import sys
+    # Docs pages and API response bodies can contain non-ASCII; the default Windows console
+    # codec (cp1252) would crash pretty_print/print on them. Force UTF-8 output.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     config = {"configurable": {"thread_id": "session-1"}}   # session identity — reused every turn
+    last_spec: ApiSpec | None = None   # most recent onboarding result, for the `extract` command
 
     print("Agent ready. Type 'end session' to quit.")
     while True:
@@ -278,13 +292,37 @@ if __name__ == "__main__":
             break
         
         if user_text.strip() == "extract":
-            spec = extract_api_spec()
+            # Prefer the structured spec from onboarding; fall back to an LLM extraction.
+            spec = last_spec or extract_api_spec()
             print(spec.model_dump_json(indent=2))
             continue
-        
-         # New onboarding target → fresh evidence corpus, so an earlier API can't leak into extraction
+
+        # New onboarding target → run the OpenAPI-first router (clean parse if a spec
+        # exists, else scrape+LLM). This is the default path on any URL submit.
         if "http" in user_text.lower():
-            DOC_CORPUS.clear()
+            url = _first_url(user_text)
+            DOC_CORPUS.clear()   # fresh evidence corpus so an earlier API can't leak in
+            try:
+                last_spec = onboard(url)
+            except Exception as e:
+                print(f"(onboarding failed: {e})")
+                continue
+            print("\n=== STRUCTURED API SPEC ===")
+            print(last_spec.model_dump_json(indent=2))
+            # Seed grounding evidence: make_api_call validates real calls against the docs
+            # corpus, but onboard() doesn't fetch through fetch_url, so feed it the spec.
+            DOC_CORPUS.append(last_spec.model_dump_json())
+            # Hand the spec to the agent as ground truth so later "test X" turns can reason
+            # over the real endpoints without having to rediscover them by reading docs.
+            handoff = (
+                f"Structured onboarding of {url} is complete. Treat this API spec as ground "
+                f"truth for what endpoints exist — do NOT rediscover them by reading docs:\n"
+                f"{last_spec.model_dump_json(indent=2)}\n"
+                f"Reply with a one-line confirmation and wait for my next instruction."
+            )
+            state = agent.invoke({"messages": [("user", handoff)]}, config)
+            state["messages"][-1].pretty_print()
+            continue
 
         state = agent.invoke({"messages": [("user", user_text)]}, config)
 
@@ -313,7 +351,7 @@ if __name__ == "__main__":
         EXTRACT_INTENT = ("summarize", "summarise", "endpoints", "understand", "structure", "spec", "extract")
         if any(w in user_text.lower() for w in EXTRACT_INTENT) and DOC_CORPUS:
             try:
-                spec = extract_api_spec()
+                spec = last_spec or extract_api_spec()   # reuse onboarding spec if we have one
                 print("\n=== STRUCTURED API SPEC ===")
                 print(spec.model_dump_json(indent=2))
             except Exception as e:

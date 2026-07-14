@@ -20,6 +20,10 @@ secrets.*
 # content). Remove this line if you WANT to sync session notes via GitHub.
 sessions/
 
+# Local Daytona sandbox experiments (throwaway exploration; need the `daytona`
+# package + DAYTONA_API_KEY env var, which aren't part of the core agent).
+daytona_*.py
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db
