@@ -60,22 +60,26 @@ def fetch_url(url: str) -> str:
     link_block = "\n".join(links[:40])
     return f"{_truncate(text, 4000, 'page text')}\n\n--- LINKS ON THIS PAGE ---\n{link_block}"
 
-@tool
-def make_api_call(url: str, method: str = "GET", headers: dict | None = None) -> str:
-    """Make a real HTTP request and return status + body. Use the literal placeholder
-    {{TOKEN}} wherever a secret belongs (e.g. Authorization: 'Bearer {{TOKEN}}')."""
-    # Grounding guard (B): refuse paths whose documented segments we haven't actually read.
-    corpus = " ".join(DOC_CORPUS).lower()
-    segments = [
-        s for s in urlparse(url).path.split("/")
-        if s and not _looks_like_id(s) and s.lower() not in SKIP_SEGMENTS
-    ]
-    ungrounded = [s for s in segments if s.lower() not in corpus]
-    if ungrounded:
-        return (f"Refusing to call {url}: path segment(s) {ungrounded} were not found in any "
-                f"documentation fetched so far. Read the relevant reference page first.")
+def _do_http_call(url: str, method: str = "GET", headers: dict | None = None,
+                  body: dict | None = None, check_grounding: bool = True) -> str:
+    """Shared real-HTTP execution: grounding guard + token substitution + request. Used by the
+    make_api_call tool AND the deterministic grounded-call flow (run_grounded_call). Secrets are
+    substituted HERE, at HTTP time, so the real token never lives in headers the caller handled.
+    `check_grounding` is skipped by run_grounded_call, whose path comes straight from the parsed
+    spec (inherently grounded) and whose only variable segments are USER-supplied param values."""
+    if check_grounding:
+        # Grounding guard (B): refuse paths whose documented segments we haven't actually read.
+        corpus = " ".join(DOC_CORPUS).lower()
+        segments = [
+            s for s in urlparse(url).path.split("/")
+            if s and not _looks_like_id(s) and s.lower() not in SKIP_SEGMENTS
+        ]
+        ungrounded = [s for s in segments if s.lower() not in corpus]
+        if ungrounded:
+            return (f"Refusing to call {url}: path segment(s) {ungrounded} were not found in any "
+                    f"documentation fetched so far. Read the relevant reference page first.")
 
-    headers = headers or {}
+    headers = dict(headers or {})
     host = urlparse(url).netloc
     token = SECRETS.get(host)
 
@@ -91,10 +95,18 @@ def make_api_call(url: str, method: str = "GET", headers: dict | None = None) ->
     }
 
     try:
-        response = requests.request(method, url, headers=real_headers, timeout=15)
+        response = requests.request(method, url, headers=real_headers,
+                                    json=body if body is not None else None, timeout=15)
     except requests.RequestException as e:
         return f"Request failed: {e}"
     return f"Status: {response.status_code}\nBody: {_truncate(response.text, 500, 'response body')}"
+
+@tool
+def make_api_call(url: str, method: str = "GET", headers: dict | None = None,
+                  body: dict | None = None) -> str:
+    """Make a real HTTP request and return status + body. Pass a JSON `body` for write calls. Use the
+    literal placeholder {{TOKEN}} wherever a secret belongs (e.g. Authorization: 'Bearer {{TOKEN}}')."""
+    return _do_http_call(url, method, headers, body)
 
 
 @tool
@@ -311,6 +323,37 @@ def _op_response_schema(op: dict) -> dict | None:
                 return s
     return None
 
+def _params_list(raw) -> list[dict]:
+    """Compact path/query parameters from an OpenAPI `parameters` array (skips $ref entries, which
+    this spec doesn't use). Each: name, in (path/query/header), type, required, default, enum."""
+    out = []
+    for p in raw or []:
+        if not isinstance(p, dict) or "$ref" in p:
+            continue
+        sch = p.get("schema") or {}
+        out.append({
+            "name": p.get("name", ""),
+            "in": p.get("in", ""),
+            "type": sch.get("type") or p.get("type") or "",
+            "required": bool(p.get("required", False)),
+            "default": sch.get("default"),
+            "enum": sch.get("enum"),
+            "desc": " ".join((p.get("description") or "").split())[:120],
+        })
+    return out
+
+def _op_scopes(op: dict) -> list[str]:
+    """Flatten the OAuth scopes an operation requires, from its OpenAPI `security` requirements
+    (each requirement maps a scheme name -> list of scopes). Deterministic; answers 'what scopes
+    does this endpoint need' from real spec data instead of the model guessing."""
+    out: list[str] = []
+    for req in op.get("security") or []:
+        for scopes in (req or {}).values():
+            for s in scopes or []:
+                if s not in out:
+                    out.append(s)
+    return out
+
 def _example_from_schema(schema: dict, _depth: int = 0) -> object:
     """Synthesize a grounded example value from a JSON Schema, preferring the spec's own per-field
     `example`/`default`/`enum` values and falling back to type placeholders. Deterministic, no LLM."""
@@ -350,6 +393,58 @@ def endpoint_examples(method: str, path: str) -> dict:
     resp = _example_from_schema(info["response"]) if info.get("response") else None
     return {"request": req, "response": resp}
 
+def emit_example(e: Endpoint, query: str) -> None:
+    """Print a grounded request/response example for endpoint `e` from its stored schema, honoring
+    which DIRECTION the query asked about ("payload"/"send" -> request only, "response"/"returns" ->
+    response only, otherwise both). If the spec has no schema for the asked direction (e.g. a GET has
+    no request body), say so and point at the direction it DOES document. Shared by the named-endpoint
+    example route and the anaphoric follow-up route."""
+    lower = query.lower()
+    ex = endpoint_examples(e.method, e.path)
+    params = endpoint_params(e.method, e.path)
+    want_req = any(k in lower for k in ("payload", "request body", "request", "send", "post body",
+                                        "what to send", "param", "input", "query string"))
+    want_resp = any(k in lower for k in ("response", "returns", "return", "comes back",
+                                         "get back", "output", "result"))
+    if want_req and not want_resp:
+        show_req, show_resp = True, False
+    elif want_resp and not want_req:
+        show_req, show_resp = False, True
+    else:
+        show_req, show_resp = True, True
+    # "request input" = parameters (query/path) OR a request body; a GET carries params, not a body.
+    req_has = ex["request"] is not None or bool(params)
+    if (show_req and req_has) or (show_resp and ex["response"] is not None):
+        print("  -> from the onboarded spec's schema (no live call needed):\n")
+        print(f"{e.method} {e.path}")
+        if show_req and params:
+            print("parameters:")
+            for p in params:
+                bits = [p["in"], p["type"] or "?", "required" if p["required"] else "optional"]
+                if p.get("default") is not None:
+                    bits.append(f"default={p['default']}")
+                if p.get("enum"):
+                    bits.append("one of " + ", ".join(str(v) for v in p["enum"][:6]))
+                print(f"  - {p['name']} ({', '.join(bits)})")
+        if show_req and ex["request"] is not None:
+            print("request body (example):")
+            print(_truncate(json.dumps(ex["request"], indent=2), 4000, "example"))
+        if show_resp and ex["response"] is not None:
+            print("response (example):")
+            print(_truncate(json.dumps(ex["response"], indent=2), 4000, "example"))
+        return
+    want = ("request input" if show_req and not show_resp
+            else "response schema" if show_resp and not show_req else "example/schema")
+    print(f"  -> the spec documents no {want} for {e.method} {e.path}.")
+    other = ("response schema" if ex["response"] is not None
+             else "request input" if (ex["request"] is not None or params) else None)
+    if other:
+        print(f"     It does document a {other} - ask for that, or say "
+              f"'test {e.method} {e.path}' for a live call.")
+    else:
+        print(f"     Want the real thing? Say 'test {e.method} {e.path}' "
+              f"and I'll make a live call to show the actual response.")
+
 def _object_properties(schema: dict, _depth: int = 0) -> dict:
     """The top-level property map of an object schema, merging allOf fragments and unwrapping the
     first oneOf/anyOf. Returns {} if the schema isn't object-shaped."""
@@ -367,6 +462,47 @@ def _object_properties(schema: dict, _depth: int = 0) -> dict:
             return _object_properties(schema[key][0], _depth + 1)
     return {}
 
+def _object_required(schema: dict, _depth: int = 0) -> list[str]:
+    """Top-level required field names of an object schema, merging allOf and the first oneOf/anyOf
+    (mirrors _object_properties). [] if the schema marks nothing required."""
+    if not isinstance(schema, dict) or _depth > 5:
+        return []
+    req = list(schema.get("required") or [])
+    for sub in schema.get("allOf") or []:
+        req += _object_required(sub, _depth + 1)
+    for key in ("oneOf", "anyOf"):
+        if schema.get(key):
+            req += _object_required(schema[key][0], _depth + 1)
+    seen, out = set(), []
+    for r in req:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+def _coerce(val: str, t: str):
+    """Coerce a user's string input to the JSON type the schema declares, so a request body carries
+    a real int/number/bool rather than a quoted string. Falls back to the raw string on any mismatch."""
+    try:
+        if t == "integer":
+            return int(val)
+        if t == "number":
+            return float(val)
+        if t == "boolean":
+            return val.strip().lower() in ("true", "1", "yes", "y")
+    except ValueError:
+        pass
+    return val
+
+def endpoint_scopes(method: str, path: str) -> list[str]:
+    """OAuth scopes an endpoint requires (from the spec's `security`), or [] if none documented."""
+    return (ENDPOINT_SCHEMAS.get((method.upper(), path)) or {}).get("scopes") or []
+
+def endpoint_params(method: str, path: str) -> list[dict]:
+    """Path/query/header parameters an endpoint accepts (from the spec), or [] if none. This is the
+    input GET endpoints take instead of a request body (page_size, from/to, filters, ...)."""
+    return (ENDPOINT_SCHEMAS.get((method.upper(), path)) or {}).get("params") or []
+
 def response_fields(method: str, path: str, limit: int = 20) -> list[str]:
     """Compact 'name (type)' list of an endpoint's top-level response fields — enough to ground the
     model on what a call actually returns, without dumping the (huge) full schema into context."""
@@ -382,7 +518,12 @@ def endpoint_listing(endpoints, field_limit: int = 15) -> str:
     for e in endpoints:
         rf = response_fields(e.method, e.path, limit=field_limit)
         tail = f"  [response fields: {', '.join(rf)}]" if rf else ""
-        lines.append(f"{e.method} {e.path} - {e.description}{tail}")
+        params = endpoint_params(e.method, e.path)
+        pnames = [f"{p['name']} ({p['in']}{', required' if p['required'] else ''})" for p in params]
+        param_tail = f"  [params: {', '.join(pnames)}]" if pnames else ""
+        sc = endpoint_scopes(e.method, e.path)
+        scope_tail = f"  [oauth scopes: {', '.join(sc)}]" if sc else ""
+        lines.append(f"{e.method} {e.path} - {e.description}{tail}{param_tail}{scope_tail}")
     return "\n".join(lines)
 
 def parse_openapi(spec_source: str) -> ApiSpec:
@@ -417,14 +558,24 @@ def parse_openapi(spec_source: str) -> ApiSpec:
     HTTP = {"get", "post", "put", "patch", "delete", "head", "options"}
     endpoints = []
     for path, ops in spec.get("paths", {}).items():
+        # Path-level parameters apply to every operation on the path; merge them with each op's own.
+        shared = ops.get("parameters") if isinstance(ops, dict) else None
         for method, op in ops.items():
             if method.lower() not in HTTP or not isinstance(op, dict):
                 continue   # skip 'parameters', '$ref', etc. at path level
             desc = (op.get("summary") or op.get("description") or "").strip()
             endpoints.append(Endpoint(method=method.upper(), path=path, description=desc))
+            params, seen = [], set()
+            for p in _params_list(shared) + _params_list(op.get("parameters")):
+                key = (p["name"], p["in"])
+                if key not in seen:
+                    seen.add(key)
+                    params.append(p)
             ENDPOINT_SCHEMAS[(method.upper(), path)] = {
                 "request": _op_request_schema(op),
                 "response": _op_response_schema(op),
+                "scopes": _op_scopes(op),
+                "params": params,
             }
 
     return ApiSpec(base_url=base_url, auth_method=auth_method, endpoints=endpoints)
@@ -659,6 +810,120 @@ def run_turn(payload, config):
     final = agent.get_state(config).values
     return final, interrupt_value
 
+def run_grounded_call(e: Endpoint, base_url: str) -> None:
+    """Execute a REAL call to endpoint `e`, collecting every value from the USER, never the model.
+    The model's only job was picking the endpoint; here Python asks for each required input (path +
+    query params, then required body fields), lets the user add optional body fields as JSON, shows
+    the fully assembled request, and fires only on explicit confirmation. This is the grounding
+    guarantee for writes - the agent can't invent a meetingId or a required field, because it never
+    supplies one. (Cancel any prompt with a blank line.)"""
+    from urllib.parse import quote, urlencode
+    print(f"  -> preparing a real call to {e.method} {e.path}. I'll ask for the required values.")
+    params = endpoint_params(e.method, e.path)
+    by_name = {p["name"]: p for p in params}
+
+    # 1. Path params: every {placeholder} in the path is required.
+    path = e.path
+    for name in re.findall(r"{([^}]+)}", e.path):
+        meta = by_name.get(name, {})
+        if meta.get("desc"):
+            print(f"     ({name}: {meta['desc']})")
+        val = input(f"     {name} (path param, {meta.get('type') or 'string'}): ").strip()
+        if not val:
+            print("     (no value - call cancelled)")
+            return
+        path = path.replace("{" + name + "}", quote(val, safe=""))
+
+    # 2. Query params: required must be filled; optional can be skipped with a blank line.
+    query = {}
+    for p in params:
+        if p["in"] != "query":
+            continue
+        tag = "required" if p["required"] else "optional, Enter to skip"
+        extra = f", default={p['default']}" if p.get("default") is not None else ""
+        if p.get("desc"):
+            print(f"     ({p['name']}: {p['desc']})")
+        val = input(f"     {p['name']} (query, {p['type'] or '?'}, {tag}{extra}): ").strip()
+        if val:
+            query[p["name"]] = val
+        elif p["required"]:
+            print("     (that one is required - call cancelled)")
+            return
+
+    # 3. Body: prompt each required top-level field; let the user add optional fields as JSON.
+    body = None
+    req_schema = (ENDPOINT_SCHEMAS.get((e.method, e.path)) or {}).get("request")
+    if req_schema:
+        props = _object_properties(req_schema)
+        required = _object_required(req_schema)
+        body = {}
+        for fname in required:
+            sub = props.get(fname, {})
+            t = sub.get("type", "?")
+            if t in ("object", "array") or "properties" in sub:
+                print(f"     {fname} (required, {t}) - example: {json.dumps(_example_from_schema(sub))}")
+                raw = input(f"     paste JSON for {fname} (Enter to use the example): ").strip()
+                try:
+                    body[fname] = json.loads(raw) if raw else _example_from_schema(sub)
+                except json.JSONDecodeError as ex:
+                    print(f"     (invalid JSON: {ex} - call cancelled)")
+                    return
+            else:
+                val = input(f"     {fname} (required, {t}): ").strip()
+                if not val:
+                    print("     (that one is required - call cancelled)")
+                    return
+                body[fname] = _coerce(val, t)
+        optional = [k for k in props if k not in required]
+        if optional:
+            preview = ", ".join(optional[:20]) + (" ..." if len(optional) > 20 else "")
+            print(f"     optional fields available: {preview}")
+            raw = input('     paste a JSON object of optional fields to add (e.g. {"start_time": "..."}), '
+                        "or Enter for none: ").strip()
+            if raw:
+                try:
+                    body.update(json.loads(raw))
+                except json.JSONDecodeError as ex:
+                    print(f"     (ignored - invalid JSON: {ex})")
+        if not body:
+            body = None   # nothing supplied -> send no body at all
+
+    # 4. Assemble the full URL.
+    if not base_url:
+        print("  (no base_url on this spec - can't build an absolute URL; cancelling)")
+        return
+    url = base_url.rstrip("/") + path + ("?" + urlencode(query) if query else "")
+
+    # 5. Auth: get a token for the host if we don't already have one (never shown to the model).
+    host = urlparse(url).netloc
+    if host and host not in SECRETS:
+        try:
+            tok = getpass.getpass(f"     Bearer token for {host} (Enter to send without auth): ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n     (call cancelled)")
+            return
+        if tok.strip():
+            SECRETS[host] = tok
+    headers = {}
+    if host in SECRETS:
+        headers["Authorization"] = "Bearer {{TOKEN}}"   # placeholder; real token substituted at HTTP time
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+
+    # 6. Show the assembled request (token stays a placeholder) and require explicit confirmation.
+    print("\n  Ready to send this real request:")
+    print(f"     {e.method} {url}")
+    if headers:
+        print(f"     headers: {headers}")
+    if body is not None:
+        print(f"     body: {json.dumps(body, indent=2)}")
+    if input("  Fire it? (y/N): ").strip().lower() not in ("y", "yes"):
+        print("  (not sent)")
+        return
+
+    # 7. Fire. Grounding is guaranteed (path is spec-derived), so skip the corpus check.
+    print(_do_http_call(url, e.method, headers, body, check_grounding=False))
+
 if __name__ == "__main__":
     import sys
     # Docs pages and API response bodies can contain non-ASCII; the default Windows console
@@ -806,61 +1071,67 @@ if __name__ == "__main__":
                                     "help me", "need to", "want to", "?")
                 # exact-only: a real named path, NOT a fuzzy keyword hit (which would pre-empt RAG).
                 named = _named_endpoint(last_spec, user_text)
-                # A follow-up that names no endpoint but refers back to the last one ("how does the
-                # response schema look like?") -> resolve to last_endpoint instead of falling to RAG.
-                anaphoric = last_endpoint is not None and (
-                    any(w in lower.split() for w in ("it", "its", "that", "this", "same", "these"))
-                    or any(p in lower for p in ("look like", "the response", "the schema",
-                                                "the payload", "the request", "the fields",
-                                                "of it", "for it")))
+                # A follow-up that names no endpoint but refers back to the last one ("payload for
+                # THIS endpoint", "what scopes does THIS action need") -> resolve to last_endpoint
+                # instead of running a fresh (possibly irrelevant) search. Cues are deliberately
+                # endpoint-REFERENTIAL (not bare "this"/"that", which also modify nouns like "that
+                # recording"), and a fresh-discovery phrasing ("which endpoint", "how do i") always
+                # wins so a genuine new search is never captured as a follow-up.
+                looks_new = any(s in lower for s in (
+                    "which endpoint", "what endpoint", "an endpoint", "any endpoint", "is there",
+                    "are there", "endpoint that", "endpoint to", "endpoint for", "how do i",
+                    "how can i", "how would i", "i want to", "i need to", "i'd like to"))
+                anaphoric = last_endpoint is not None and not looks_new and any(p in lower for p in (
+                    "this endpoint", "that endpoint", "the endpoint", "this action", "that action",
+                    "this one", "that one", "this call", "that call", "same endpoint",
+                    "the response", "the payload", "the request body", "the schema", "the fields",
+                    "look like", "of it", "for it", "its "))
+
+                # test/execute -> deterministic grounded call: collect required inputs FROM THE USER
+                # (path/query params + required body fields), confirm, then fire. The model never
+                # supplies values, so it can't invent a meetingId or a required field. Needs a concrete
+                # endpoint (named, or the one in focus); otherwise fall through to the exploratory agent.
+                if any(p in lower for p in TEST_INTENT):
+                    target = named or last_endpoint
+                    if target is not None:
+                        try:
+                            run_grounded_call(target, last_spec.base_url or "")
+                        except (EOFError, KeyboardInterrupt):
+                            print("\n  (call cancelled - back to prompt)")
+                        last_endpoint = target
+                        continue
 
                 if not any(p in lower for p in TEST_INTENT):
-                    # 1. Example/payload for the named (or referred-back) endpoint -> synthesize from
-                    #    schema (no live call), honoring which DIRECTION the user asked about.
-                    if any(p in lower for p in EXAMPLE_INTENT):
-                        target = named or (last_endpoint if anaphoric else None)
-                        if target is not None:
-                            e = target
-                            ex = endpoint_examples(e.method, e.path)
-                            want_req = any(k in lower for k in ("payload", "request body", "request",
-                                                                "send", "post body", "what to send"))
-                            want_resp = any(k in lower for k in ("response", "returns", "return",
-                                                                 "comes back", "get back", "output",
-                                                                 "result"))
-                            if want_req and not want_resp:
-                                show_req, show_resp = True, False
-                            elif want_resp and not want_req:
-                                show_req, show_resp = False, True
-                            else:
-                                show_req, show_resp = True, True
-                            has = ((show_req and ex["request"] is not None)
-                                   or (show_resp and ex["response"] is not None))
-                            if has:
-                                print("  -> from the onboarded spec's schema (no live call needed):\n")
-                                print(f"{e.method} {e.path}")
-                                if show_req and ex["request"] is not None:
-                                    print("request body (example):")
-                                    print(_truncate(json.dumps(ex["request"], indent=2), 4000, "example"))
-                                if show_resp and ex["response"] is not None:
-                                    print("response (example):")
-                                    print(_truncate(json.dumps(ex["response"], indent=2), 4000, "example"))
-                            else:
-                                # The spec has no schema for the direction asked (e.g. a GET has no
-                                # request body). Say so, and point at the direction it DOES document.
-                                want = ("request body" if show_req and not show_resp
-                                        else "response schema" if show_resp and not show_req
-                                        else "example/schema")
-                                print(f"  -> the spec documents no {want} for {e.method} {e.path}.")
-                                other = ("response schema" if ex["response"] is not None
-                                         else "request body" if ex["request"] is not None else None)
-                                if other:
-                                    print(f"     It does document a {other} - ask for that, or say "
-                                          f"'test {e.method} {e.path}' for a live call.")
-                                else:
-                                    print(f"     Want the real thing? Say 'test {e.method} {e.path}' "
-                                          f"and I'll make a live call to show the actual response.")
-                            last_endpoint = e
-                            continue
+                    # 0. Anaphoric follow-up about the last endpoint ("payload for THIS endpoint",
+                    #    "what scopes does THIS action need") -> answer about last_endpoint, resolved
+                    #    HERE before any fresh search. This is what stops a follow-up from (a) running
+                    #    an irrelevant semantic search and (b) overwriting the focus endpoint with that
+                    #    search's top off-topic hit. Crucially, it does NOT reassign last_endpoint - a
+                    #    follow-up asks *about* the current endpoint, it doesn't move the focus.
+                    if anaphoric and not named:
+                        e = last_endpoint
+                        if any(p in lower for p in EXAMPLE_INTENT):
+                            emit_example(e, user_text)
+                        else:
+                            grounded = (
+                                "Answer the user's question about THIS API endpoint using ONLY the "
+                                "info below (method, path, description, and response fields are the "
+                                "ONLY documented facts). If the answer isn't in this info - e.g. OAuth "
+                                "scopes, rate limits, error codes - say so plainly and do NOT guess. "
+                                "Do NOT invent endpoints, paths, parameters, or fields.\n\n"
+                                f"Endpoint:\n{endpoint_listing([e])}\n\nUser question: {user_text}"
+                            )
+                            print(f"  -> answering about {e.method} {e.path} from the onboarded spec...")
+                            print(llm.invoke(grounded).content)
+                        continue
+
+                    # 1. Example/payload for a NAMED endpoint -> synthesize from schema (no live call),
+                    #    honoring which DIRECTION the user asked about. (Anaphoric example asks were
+                    #    already handled above.)
+                    if named and any(p in lower for p in EXAMPLE_INTENT):
+                        emit_example(named, user_text)
+                        last_endpoint = named
+                        continue
 
                     # 2. A named endpoint, or a describe-style question -> describe it, grounded.
                     if named or any(w in lower for w in DESCRIBE_INTENT):
