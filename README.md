@@ -85,12 +85,14 @@ you> test the list endpoint                        # → real, grounded HTTP cal
 
 Deliberately scoped as a **bootstrapping accelerator and portfolio piece, not a production tool.**
 
+- **Built for small-to-moderate APIs.** The whole thing runs on a local 7B at `num_ctx=8192`, so an endpoint's full documentation — every parameter, plus its request and response schema expanded to *all* nested levels — has to fit in a few thousand tokens. That holds comfortably for typical SaaS specs (across Calendly's 61 endpoints a complete nested response tree is ~600 chars at the median, ~2.4 KB at the worst). A very large or deeply nested API — sprawling polymorphic schemas, dozens of levels, huge `oneOf` unions — will exceed that budget on a single machine with 8 GB VRAM. It degrades rather than breaks: the schema is cut to fit and **labelled `[!] TRUNCATED`** in the same breath, so the model states plainly that it is not the full schema and points you at the vendor's docs, instead of presenting a partial API as a complete one. Bigger APIs want a bigger context window, not a code change.
 - **Discovery is only as good as a small local embedder** — vocabulary-overlap queries land; hard synonym leaps ("set up a video call" → *meeting*) can miss.
 - **Session state is in-memory** (`MemorySaver`) — a restart loses history; the RAG index rebuilds once per spec per session (~45s, no disk cache yet).
 - **Large *scraped* doc sets are front-truncated** before extraction; the clean lane is OpenAPI. Scrape fallback is noisy on sprawling hypermedia docs (e.g. GitHub) — an accepted trade-off.
-- **Verified against:** deterministic OpenAPI parse (Swagger Petstore, Zoom 184-endpoint spec); secret-handling proven end-to-end on `httpbingo.org/bearer`. Real third-party `200`s shown on public/no-auth endpoints.
+- **Verified against:** deterministic OpenAPI parse (Swagger Petstore 2.0 **and** 3.0, Calendly 61-endpoint spec, Zoom 184-endpoint spec); secret-handling proven end-to-end on `httpbingo.org/bearer`. Real third-party `200`s shown on public/no-auth endpoints.
+- **Call-fidelity audit:** `tests/test_call_fidelity.py` asserts the parser keeps every fact an HTTP request depends on — where the credential goes (`apiKey in header api_key` ≠ `Bearer`), request bodies in both OpenAPI 3 and Swagger 2.0 layouts, media types, nested required fields, validation constraints, `deprecated`. Runs against pinned specs in `tests/fixtures/` (pinned deliberately — a hosted spec that gains endpoints between runs makes a vendor release look like a regression).
 
-**Shipped:** local JSON/YAML specs · intent routing + RAG discovery · method-aware matching (`update`→PATCH) · endpoint pagination · last-endpoint memory for follow-ups · per-turn error safety net.
+**Shipped:** local JSON/YAML specs · intent routing + RAG discovery · method-aware matching (`update`→PATCH) · endpoint pagination · last-endpoint memory for follow-ups · fully-nested schema expansion with announced truncation · per-turn error safety net.
 
 **Next:** persist the RAG index to disk · Streamlit UI (the hard part: mapping the `interrupt()` auth handoff onto Streamlit reruns) · code-snippet generation built from *real tool results*.
 
