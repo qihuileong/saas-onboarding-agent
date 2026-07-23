@@ -49,6 +49,16 @@ and can make **real, grounded API calls** on the user's behalf. Runs fully local
   via `llm.with_structured_output(...)`. This is what stopped the model inventing endpoints — keep it.
 - **Grounding guards.** `make_api_call` refuses paths whose segments never appeared in fetched docs
   (`DOC_CORPUS`); the system prompt forbids inventing endpoints or fabricating tool results.
+- **Check the model's OUTPUT, not just its input.** The grounding prompts forbid inventing
+  endpoints, and the 7B complied for four turns and then didn't: handed a candidate list containing
+  `GET /scheduled_events`, it produced **`POST /scheduled_events`** — inventing a verb because the
+  collection existed — and attached `POST /invitees`' required fields to it. Retrieval was correct;
+  the model added a fact that was never in context, so no amount of prompt wording fixes it.
+  `verify_endpoint_mentions()` regexes every `METHOD /path` out of the answer, normalises it
+  (host and base path stripped, `{uuid}`/`{id}` collapsed to `{}`, markdown punctuation trimmed —
+  collapse templates BEFORE trimming, or a trailing `}` is eaten and nothing matches) and checks it
+  against the spec, printing what's real on that path when it isn't. Every spec-answering route
+  goes through `grounded_answer()` so the check can't be forgotten at one of the three call sites.
 - **Secrets never reach the model.** Tokens live in the module-level `SECRETS` dict (host -> token),
   never in `messages`. The model uses the literal placeholder `{{TOKEN}}`; real values are substituted
   only inside `make_api_call`. `authorize` obtains tokens via LangGraph `interrupt` (human in the loop).

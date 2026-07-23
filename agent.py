@@ -1039,6 +1039,83 @@ def endpoint_listing(endpoints, field_limit: int = 15, param_detail: bool = Fals
                 lines.extend(_param_line(p) for p in params)
     return "\n".join(lines)
 
+# "POST /scheduled_events", "**GET** `/users/me`", "POST https://api.calendly.com/invitees" - the
+# forms a model actually writes an endpoint in. Method and path must be adjacent; prose like
+# "use GET on the events endpoint" deliberately does not match.
+_MENTION_RE = re.compile(
+    r"\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b[\s`*_]{1,4}"
+    r"((?:https?://[^\s`*)\],]+)?/[A-Za-z0-9_\-./{}]*)"
+)
+
+def _norm_path(p: str, base_url: str = "") -> str:
+    """A path in the form used for comparison: no host, no base path, parameter names collapsed
+    ({uuid} and {id} are the same slot), no trailing slash or markdown punctuation."""
+    p = (p or "").strip().strip("`*_\"'")
+    if p.startswith("http"):
+        p = urlparse(p).path
+    if base_url:
+        bp = urlparse(base_url).path.rstrip("/")
+        if bp and p.startswith(bp):
+            p = p[len(bp):]
+    # Collapse templates BEFORE trimming punctuation: a path legitimately ends in '}', so stripping
+    # first turns "/event_types/{id}" into "/event_types/{id" and it stops matching "{uuid}".
+    p = re.sub(r"\{[^}]*\}", "{}", p)
+    p = p.rstrip(".,;:!?)]`*_\"'")
+    return p.rstrip("/") or "/"
+
+def verify_endpoint_mentions(answer: str, spec: "ApiSpec") -> str:
+    """Check every endpoint the model NAMED against the spec, and report any that don't exist.
+
+    The grounding prompts forbid inventing endpoints, and a 7B obeys that until it doesn't: given a
+    candidate list containing `GET /scheduled_events`, it produced `POST /scheduled_events` - a
+    textbook REST completion, inventing a verb because the collection existed - and then attached
+    another endpoint's required body fields to it. Retrieval was correct; the model added a fact
+    that was never in its context.
+
+    So this is a deterministic check on the OUTPUT, the same shape as make_api_call's DOC_CORPUS
+    guard but for prose: no prompt wording can talk it out of the answer, because it isn't asking
+    the model. Returns a correction block, or "" when every mention is real."""
+    real: dict[str, set[str]] = {}
+    for e in spec.endpoints:
+        real.setdefault(_norm_path(e.path), set()).add(e.method.upper())
+
+    bad, seen = [], set()
+    for method, raw in _MENTION_RE.findall(answer or ""):
+        np = _norm_path(raw, spec.base_url or "")
+        if np == "/" or (method.upper(), np) in seen:
+            continue
+        seen.add((method.upper(), np))
+        methods = real.get(np)
+        if methods is None or method.upper() not in methods:
+            bad.append((method.upper(), np, methods))
+    if not bad:
+        return ""
+
+    lines = ["  [!] grounding check: the answer above names endpoint(s) that are NOT in this spec."]
+    for method, np, methods in bad:
+        if methods:
+            lines.append(f"      {method} {np} does not exist - the spec documents only "
+                         f"{', '.join(sorted(methods))} on that path.")
+        else:
+            head = np.split("/")[1] if "/" in np.strip("/") + "/" else ""
+            near = sorted({f"{m} {e.path}" for e in spec.endpoints
+                           for m in [e.method.upper()]
+                           if head and _norm_path(e.path).lstrip("/").startswith(head)})
+            lines.append(f"      {method} {np} does not exist." +
+                         (f" Real endpoints under /{head}: {', '.join(near[:6])}"
+                          if near else " No endpoint with that path is documented."))
+    lines.append("      Treat those parts of the answer as unreliable; the rest came from the spec.")
+    return "\n".join(lines)
+
+def grounded_answer(prompt: str, spec: "ApiSpec") -> None:
+    """Run a grounded prompt and print the answer, then verify the endpoints it named. Every
+    spec-answering route goes through here so the check can't be forgotten at one of them."""
+    answer = llm.invoke(_fit_prompt(prompt)).content
+    print(answer)
+    warning = verify_endpoint_mentions(answer, spec)
+    if warning:
+        print(warning)
+
 def parse_openapi(spec_source: str) -> ApiSpec:
     """Deterministically turn an OpenAPI/Swagger spec into an ApiSpec. No LLM involved.
     `spec_source` is an http(s) URL or a local file path (JSON or YAML). Side effect: repopulates
@@ -1754,7 +1831,7 @@ if __name__ == "__main__":
                                 f"\n\nUser question: {user_text}"
                             )
                             print(f"  -> answering about {e.method} {e.path} from the onboarded spec...")
-                            print(llm.invoke(_fit_prompt(grounded)).content)
+                            grounded_answer(grounded, last_spec)
                         continue
 
                     # 1. Example/payload for a NAMED endpoint -> synthesize from schema (no live call),
@@ -1785,7 +1862,7 @@ if __name__ == "__main__":
                                 f"Endpoints:\n{listing}\n\nUser question: {user_text}"
                             )
                             print("  -> answering from the onboarded spec (no tool call needed)...")
-                            print(llm.invoke(_fit_prompt(grounded)).content)
+                            grounded_answer(grounded, last_spec)
                             last_endpoint = matches[0]
                             continue
 
@@ -1820,7 +1897,7 @@ if __name__ == "__main__":
                             )
                             print(f"  -> semantic search over {len(ENDPOINT_INDEX) or len(last_spec.endpoints)} "
                                   f"endpoints (no tool call needed)...")
-                            print(llm.invoke(_fit_prompt(grounded)).content)
+                            grounded_answer(grounded, last_spec)
                             last_endpoint = matches[0]
                             continue
                 # nothing matched -> fall through to the normal tool-agent
