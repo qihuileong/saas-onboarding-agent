@@ -80,12 +80,65 @@ uv run python agent.py        # interactive agent — the main program
 #   commands:  extract  (dump full spec)   |   end session  (quit)
 ```
 
+Prefer a browser UI:
+
+```bash
+uv run streamlit run streamlit_app.py
+```
+
+The local Streamlit app includes staged onboarding and chat progress, grounded chat, a searchable
+endpoint/schema explorer, a two-step real-call builder with a credential-safe preview, and
+an event log plus local detailed traces. The call builder exposes every templated path parameter,
+reads credentials from an always-available sidebar manager labelled from the selected OpenAPI
+scheme (PAT, OAuth access token, API key, or Basic credential), and disables sending when
+authentication is missing or cannot be placed safely. Chat checks that same store when a call is
+requested. Calls selected from Chat return their results to Chat automatically. For a failed HTTP
+response, the local agent reviews the masked request, the actual response, and that endpoint's
+schema, then drafts a corrected next request without sending it. Calls prepared independently in
+API Call stay there; a failed manual call has an explicit **Ask agent to diagnose this response**
+action. It never guesses Bearer authentication. The Debug & Traces tab separates the chat
+transcript, detailed traces, and event log;
+traces can be filtered, copied, or downloaded individually without including the transcript. A
+complete bundle remains available when the entire session is needed.
+
+Credentials stay in local session memory, never enter the model prompt, and are redacted from logs
+and traces. One credential is reused across endpoints with the same API host and auth scheme during
+the browser session; it is not written to disk or retained in the process-global HTTP cache after a
+request. Trace bundles can contain API response data and should be reviewed before sharing.
+Failed response bodies can also be sent to the local Ollama model for correction guidance, so they
+may contain API/user data even though credentials remain excluded.
+Langfuse remains a useful later persistence/evaluation backend for these same spans, while the local
+bundle makes a user session debuggable now without another service.
+
 **Try it:** onboard a spec, then ask natural questions —
 ```
 you> read: ./openapi.json
 you> which endpoint lets me update a meeting?      # → RAG discovery
 you> what's the payload for PATCH /meetings/{id}?  # → example synthesized from schema
 you> test the list endpoint                        # → real, grounded HTTP call
+```
+
+---
+
+## Testing
+
+The regression suite is split by failure boundary:
+
+```bash
+uv run python tests/test_call_fidelity.py
+uv run python tests/test_mention_check.py
+uv run python tests/test_onboard_evidence.py
+uv run python tests/test_ui_service.py
+uv run python tests/test_streamlit_workflows.py
+```
+
+Those checks are network-free and cover parsing fidelity, grounding, onboarding recovery,
+authentication placement, request validation, credential isolation/redaction, and complete
+Streamlit prepare/confirm/result/diagnosis journeys. To exercise the installed Ollama embedding and
+chat models as well—without making an external API call—run:
+
+```bash
+uv run python tests/test_live_agent_journeys.py
 ```
 
 ---
@@ -104,17 +157,19 @@ Deliberately scoped as a **bootstrapping accelerator and portfolio piece, not a 
 
 **Shipped:** local JSON/YAML specs · intent routing + RAG discovery · method-aware matching (`update`→PATCH) · endpoint pagination · last-endpoint memory for follow-ups · fully-nested schema expansion with announced truncation · evidence gate before extraction · spec walk-up from a pointer URL · output-side endpoint verification · scraped-vs-parsed provenance in the coverage report · per-turn error safety net.
 
-**Next:** persist the RAG index to disk · Streamlit UI (the hard part: mapping the `interrupt()` auth handoff onto Streamlit reruns) · code-snippet generation built from *real tool results*.
+**Next:** persist the RAG index to disk · optional Langfuse tracing · code-snippet generation built from *real tool results*.
 
 ---
 
 ## Tech stack
 
-**Python 3.14** · **LangGraph** (`create_react_agent`, `interrupt`, `MemorySaver`) · **Ollama** (`qwen2.5:7b`, `nomic-embed-text`) · **Pydantic** (constrained extraction) · **requests + BeautifulSoup** (scraping) · **pyyaml** · **uv** (packaging).
+**Python 3.14** · **Streamlit** · **LangGraph** (`create_react_agent`, `interrupt`, `MemorySaver`) · **Ollama** (`qwen2.5:7b`, `nomic-embed-text`) · **Pydantic** (constrained extraction) · **requests + BeautifulSoup** (scraping) · **pyyaml** · **uv** (packaging).
 
 | File | Role |
 | :--- | :--- |
 | **`agent.py`** | The project. ReAct agent + tools (`fetch_url`, `make_api_call`, `authorize`), OpenAPI-first `onboard()`, intent-routing REPL, RAG discovery index. |
+| **`streamlit_app.py`** | Browser UI: progress, grounded chat, endpoint explorer, safe real-call builder, event log, and downloadable traces. |
+| **`ui_service.py`** | Non-terminal chat routing, trace spans, request preparation/execution, safe previews, and redaction. |
 | **`scraper.py`** | `fetch_text` (strips boilerplate, returns text + links) and `crawl` (BFS over doc pages). |
 | **`extract.py` / `main.py`** | One-shot prose-summary path + its CLI entry point. |
 

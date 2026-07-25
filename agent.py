@@ -13,10 +13,13 @@ import os
 import json
 import yaml
 import textwrap
+from typing import Callable
 from pydantic import BaseModel, Field
 from collections import Counter
 from scraper import crawl
 from urllib.parse import urlparse, urljoin, urlunparse
+
+API_VERSION = 4
 
 SECRETS: dict[str, str] = {}   # host -> token. Never enters `messages`, so the model never sees it.
 DOC_CORPUS: list[str] = []           # all doc text fetched so far (grounding evidence)
@@ -76,12 +79,15 @@ def fetch_url(url: str) -> str:
     return f"{_truncate(text, 4000, 'page text')}\n\n--- LINKS ON THIS PAGE ---\n{link_block}"
 
 def _do_http_call(url: str, method: str = "GET", headers: dict | None = None,
-                  body: dict | None = None, check_grounding: bool = True) -> str:
+                  body: dict | None = None, check_grounding: bool = True,
+                  response_limit: int | None = 500) -> str:
     """Shared real-HTTP execution: grounding guard + token substitution + request. Used by the
     make_api_call tool AND the deterministic grounded-call flow (run_grounded_call). Secrets are
     substituted HERE, at HTTP time, so the real token never lives in headers the caller handled.
     `check_grounding` is skipped by run_grounded_call, whose path comes straight from the parsed
-    spec (inherently grounded) and whose only variable segments are USER-supplied param values."""
+    spec (inherently grounded) and whose only variable segments are USER-supplied param values.
+    Tool/CLI callers keep the small default body limit for model context; the browser UI passes
+    ``None`` because its response is rendered locally and never enters the model prompt."""
     if check_grounding:
         # Grounding guard (B): refuse paths whose documented segments we haven't actually read.
         corpus = " ".join(DOC_CORPUS).lower()
@@ -124,7 +130,12 @@ def _do_http_call(url: str, method: str = "GET", headers: dict | None = None,
                                     json=body if body is not None else None, timeout=15)
     except requests.RequestException as e:
         return f"Request failed: {e}"
-    return f"Status: {response.status_code}\nBody: {_truncate(response.text, 500, 'response body')}"
+    response_body = (
+        response.text
+        if response_limit is None
+        else _truncate(response.text, response_limit, "response body")
+    )
+    return f"Status: {response.status_code}\nBody: {response_body}"
 
 @tool
 def make_api_call(url: str, method: str = "GET", headers: dict | None = None,
@@ -229,11 +240,26 @@ def search_endpoints_semantic(query: str, k: int = 5) -> list[Endpoint]:
     return [e for _, e in ranked[:k]]
 
 _CLAUSE_SPLIT = re.compile(r"\b(?:then|and then|and|after that|afterwards|next|followed by)\b|[,;]", re.I)
+_QUERY_ALIASES = {
+    # Calendly and several other scheduling APIs call a human attendee an "invitee". Without this
+    # deterministic bridge, keyword fallback ranks event-type endpoints for "add attendees" and
+    # misses the endpoint that actually creates the booking.
+    "attendee": ("invitee",),
+    "attendees": ("invitee", "invitees", "guests"),
+    "guest": ("invitee",),
+    "guests": ("invitee", "invitees"),
+}
+
+def _expand_query_aliases(query: str) -> str:
+    words = set(re.findall(r"[a-z_]+", query.lower()))
+    additions = [alias for word in words for alias in _QUERY_ALIASES.get(word, ())]
+    return query + (" " + " ".join(additions) if additions else "")
 
 def search_endpoints(query: str, k: int = 8) -> list[Endpoint]:
     """Discovery retrieval. Splits a multi-intent query ('create a meeting THEN download the
     recording') into clauses and unions each clause's top matches — a compound query's single
     embedding is diluted and neither intent ranks. Single-intent queries pass straight through."""
+    query = _expand_query_aliases(query)
     clauses = [c.strip() for c in _CLAUSE_SPLIT.split(query) if len(c.strip()) >= 8]
     if len(clauses) <= 1:
         return search_endpoints_semantic(query, k)
@@ -489,6 +515,7 @@ def _params_list(raw) -> list[dict]:
             "name": p.get("name", ""),
             "in": p.get("in", ""),
             "type": t,
+            "format": sch.get("format") or p.get("format") or "",
             "required": bool(p.get("required", False)),
             "default": sch.get("default", p.get("default")),
             "enum": sch.get("enum") or p.get("enum"),
@@ -507,6 +534,18 @@ def _params_list(raw) -> list[dict]:
             "style": p.get("style", "form") if t.startswith("array") else None,
         })
     return out
+
+
+def parameter_format(param: dict) -> str:
+    """Return a parameter's documented format, including a safe legacy-snapshot fallback."""
+    documented = param.get("format") or ""
+    if documented:
+        return documented
+    # Older Streamlit schema snapshots predate the explicit `format` field but retain descriptions
+    # such as "the user's URI". Preserve the same validation without forcing a new onboarding run.
+    if re.search(r"\bURI\b", param.get("desc") or "", re.I):
+        return "uri"
+    return ""
 
 def _parse_security_schemes(spec: dict) -> dict[str, dict]:
     """securitySchemes (OpenAPI 3) / securityDefinitions (Swagger 2) -> how to actually SEND the
@@ -537,23 +576,103 @@ def _parse_security_schemes(spec: dict) -> dict[str, dict]:
         }
     return out
 
+def credential_options(scheme_names: list[str]) -> list[dict]:
+    """Describe each documented authentication alternative without guessing.
+
+    The returned placement is directly usable by request builders. Unsupported schemes remain in
+    the result with ``supported=False`` so the UI can explain why it refuses to send.
+    """
+    options = []
+    for name in scheme_names:
+        scheme = AUTH_SCHEMES.get(name) or {}
+        auth_type = scheme.get("type", "")
+        http_scheme = scheme.get("scheme", "")
+        where = scheme.get("in", "")
+        param = scheme.get("param", "")
+        lowered_name = name.lower()
+        option = {
+            "name": name,
+            "supported": True,
+            "kind": "",
+            "parameter": "",
+            "template": "",
+            "label": name,
+            "input_label": "API credential",
+            "help": "",
+            "token_url": scheme.get("token_url", ""),
+            "authorization_url": scheme.get("authorization_url", ""),
+        }
+        if auth_type == "apiKey" and where in ("header", "query", "cookie") and param:
+            option.update(
+                kind=where,
+                parameter=param,
+                template="{{TOKEN}}",
+                label=f"API key ({param} in {where})",
+                input_label=f"API key for `{param}`",
+                help=f"The spec sends this value in the `{param}` {where}.",
+            )
+        elif auth_type == "oauth2":
+            option.update(
+                kind="header",
+                parameter="Authorization",
+                template="Bearer {{TOKEN}}",
+                label="OAuth 2.0 access token",
+                input_label="OAuth 2.0 access token",
+                help="Paste an issued access token, not a client secret or authorization code.",
+            )
+        elif auth_type == "openIdConnect":
+            option.update(
+                kind="header",
+                parameter="Authorization",
+                template="Bearer {{TOKEN}}",
+                label="OpenID Connect access token",
+                input_label="OpenID Connect access token",
+                help="Paste an issued bearer access token.",
+            )
+        elif auth_type == "http" and http_scheme == "bearer":
+            is_pat = "personal" in lowered_name and "token" in lowered_name
+            option.update(
+                kind="header",
+                parameter="Authorization",
+                template="Bearer {{TOKEN}}",
+                label="Personal access token" if is_pat else "Bearer access token",
+                input_label="Personal access token (PAT)" if is_pat else "Bearer access token",
+                help="The value is sent in the Authorization header as a Bearer token.",
+            )
+        elif auth_type == "http" and http_scheme == "basic":
+            option.update(
+                kind="header",
+                parameter="Authorization",
+                template="Basic {{TOKEN}}",
+                label="HTTP Basic credential",
+                input_label="HTTP Basic credential",
+                help="Paste the Base64-encoded `username:password` value.",
+            )
+        else:
+            detail = f"{auth_type or 'unknown'}"
+            if http_scheme:
+                detail += f"/{http_scheme}"
+            option.update(
+                supported=False,
+                label=f"{name} (unsupported: {detail})",
+                help="This authentication scheme cannot be safely constructed by the call builder.",
+            )
+        options.append(option)
+    return options
+
+
 def _credential_placement(scheme_names: list[str]) -> tuple[str, str, str]:
-    """Where a credential goes for the first usable scheme: (kind, name, template).
-      ("header", "Authorization", "Bearer {{TOKEN}}")   bearer / oauth2
-      ("header", "api_key",       "{{TOKEN}}")          apiKey in header
-      ("query",  "api_key",       "{{TOKEN}}")          apiKey in query
-    Defaults to bearer when the spec documents nothing - that's the common case, but it is a GUESS
-    and callers say so, rather than presenting it as what the spec requires."""
-    for n in scheme_names:
-        s = AUTH_SCHEMES.get(n) or {}
-        t, where, pname = s.get("type"), s.get("in"), s.get("param")
-        if t == "apiKey" and where in ("header", "query") and pname:
-            return where, pname, "{{TOKEN}}"
-        if t == "http" and s.get("scheme") == "basic":
-            return "header", "Authorization", "Basic {{TOKEN}}"
-        if t in ("oauth2", "http") or s.get("scheme") == "bearer":
-            return "header", "Authorization", "Bearer {{TOKEN}}"
-    return "header", "Authorization", "Bearer {{TOKEN}}"
+    """Return the first supported documented placement; never invent a fallback."""
+    option = next(
+        (item for item in credential_options(scheme_names) if item["supported"]),
+        None,
+    )
+    if option is None:
+        named = ", ".join(scheme_names) or "none"
+        raise ValueError(
+            f"No supported credential placement is documented (schemes: {named})."
+        )
+    return option["kind"], option["parameter"], option["template"]
 
 def auth_instructions(method: str, path: str) -> str:
     """One line telling the user exactly how to authenticate THIS endpoint, and where to get the
@@ -561,13 +680,18 @@ def auth_instructions(method: str, path: str) -> str:
     names = endpoint_auth_schemes(method, path)
     if not names:
         return ""
-    kind, pname, template = _credential_placement(names)
-    shown = template.replace("{{TOKEN}}", "<token>")
-    where = f"{kind} `{pname}: {shown}`" if kind == "header" else f"query parameter `{pname}=<token>`"
-    urls = [ (AUTH_SCHEMES.get(n) or {}).get("token_url") for n in names ]
-    urls = [u for u in urls if u]
-    tail = f" Get a token from {urls[0]}." if urls else ""
-    return f"send the credential as {where} (scheme: {' or '.join(names)})." + tail
+    rendered = []
+    for option in credential_options(names):
+        if not option["supported"]:
+            rendered.append(option["label"])
+            continue
+        shown = option["template"].replace("{{TOKEN}}", "<credential>")
+        if option["kind"] == "header":
+            placement = f"header `{option['parameter']}: {shown}`"
+        else:
+            placement = f"{option['kind']} `{option['parameter']}=<credential>`"
+        rendered.append(f"{option['label']} via {placement}")
+    return "Accepted authentication: " + "; or ".join(rendered) + "."
 
 def _doc_scopes(text: str) -> list[str]:
     """Scopes a spec documents in PROSE instead of in `security[]`. Calendly writes
@@ -610,6 +734,33 @@ def _op_security(op: dict, root_security=None) -> tuple[list[str], list[str]]:
     if not scopes:   # fall back to prose only when the structured field gave us nothing
         scopes = _doc_scopes(op.get("description") or "")
     return scopes, schemes
+
+
+def _parameter_any_of_groups(description: str, params: list[dict]) -> list[dict]:
+    """Extract simple prose-only "either X or Y is required" parameter constraints.
+
+    OpenAPI marks each member optional because neither one is individually mandatory, leaving the
+    cross-field rule in operation prose. Keep only names that are real parameters on this operation.
+    """
+    known = {param["name"]: param.get("in", "") for param in params}
+    groups = []
+    pattern = re.compile(
+        r"\bEither\s+[`'\"]?([A-Za-z_][\w.-]*)[`'\"]?\s+or\s+"
+        r"[`'\"]?([A-Za-z_][\w.-]*)[`'\"]?\s+(?:is|are)\s+required\b",
+        re.I,
+    )
+    for match in pattern.finditer(description or ""):
+        names = [match.group(1), match.group(2)]
+        if not all(name in known for name in names):
+            continue
+        locations = {known[name] for name in names}
+        group = {
+            "names": names,
+            "in": locations.pop() if len(locations) == 1 else "",
+        }
+        if group not in groups:
+            groups.append(group)
+    return groups
 
 def _example_from_schema(schema: dict, _depth: int = 0) -> object:
     """Synthesize a grounded example value from a JSON Schema, preferring the spec's own per-field
@@ -860,12 +1011,12 @@ def _is_followup(user_text: str, focus: "Endpoint | None" = None) -> bool:
     return (len(user_text.split()) <= 12 and "endpoints" not in lower
             and any(a in lower for a in ENDPOINT_ATTRS))
 
-def emit_example(e: Endpoint, query: str) -> None:
-    """Print a grounded request/response example for endpoint `e` from its stored schema, honoring
+def format_example(e: Endpoint, query: str) -> str:
+    """Return a grounded request/response example for endpoint `e` from its stored schema, honoring
     which DIRECTION the query asked about ("payload"/"send" -> request only, "response"/"returns" ->
     response only, otherwise both). If the spec has no schema for the asked direction (e.g. a GET has
     no request body), say so and point at the direction it DOES document. Shared by the named-endpoint
-    example route and the anaphoric follow-up route."""
+    example route and the anaphoric follow-up route, including the Streamlit UI."""
     lower = query.lower()
     ex = endpoint_examples(e.method, e.path)
     params = endpoint_params(e.method, e.path)
@@ -882,30 +1033,39 @@ def emit_example(e: Endpoint, query: str) -> None:
     # "request input" = parameters (query/path) OR a request body; a GET carries params, not a body.
     req_has = ex["request"] is not None or bool(params)
     if (show_req and req_has) or (show_resp and ex["response"] is not None):
-        print("  -> from the onboarded spec's schema (no live call needed):\n")
-        print(f"{e.method} {e.path}")
+        lines = ["From the onboarded spec's schema (no live call needed):", "",
+                 f"{e.method} {e.path}"]
+        if e.description:
+            lines.append(f"Documented purpose: {e.description}")
+        notes = (ENDPOINT_SCHEMAS.get((e.method.upper(), e.path)) or {}).get("notes")
+        if notes:
+            lines.append(f"Documented behavior: {notes}")
         if show_req and params:
-            print("parameters:")
+            lines.append("parameters:")
             for p in params:
-                print(_param_line(p))   # same rendering the grounded prompts see
+                lines.append(_param_line(p))   # same rendering the grounded prompts see
         if show_req and ex["request"] is not None:
-            print("request body (example):")
-            print(_truncate(json.dumps(ex["request"], indent=2), 4000, "example"))
+            lines += ["request body (example):", "```json",
+                      _truncate(json.dumps(ex["request"], indent=2), 4000, "example"), "```"]
         if show_resp and ex["response"] is not None:
-            print("response (example):")
-            print(_truncate(json.dumps(ex["response"], indent=2), 4000, "example"))
-        return
+            lines += ["response (example):", "```json",
+                      _truncate(json.dumps(ex["response"], indent=2), 4000, "example"), "```"]
+        return "\n".join(lines)
     want = ("request input" if show_req and not show_resp
             else "response schema" if show_resp and not show_req else "example/schema")
-    print(f"  -> the spec documents no {want} for {e.method} {e.path}.")
+    lines = [f"The spec documents no {want} for {e.method} {e.path}."]
     other = ("response schema" if ex["response"] is not None
              else "request input" if (ex["request"] is not None or params) else None)
     if other:
-        print(f"     It does document a {other} - ask for that, or say "
-              f"'test {e.method} {e.path}' for a live call.")
+        lines.append(f"It does document a {other}. Ask for that, or open the API Call tab "
+                     "to make a live request.")
     else:
-        print(f"     Want the real thing? Say 'test {e.method} {e.path}' "
-              f"and I'll make a live call to show the actual response.")
+        lines.append("Use the API Call tab if you want to make a live request.")
+    return "\n".join(lines)
+
+def emit_example(e: Endpoint, query: str) -> None:
+    """Terminal renderer for :func:`format_example`."""
+    print(format_example(e, query))
 
 def _object_properties(schema: dict, _depth: int = 0) -> dict:
     """The top-level property map of an object schema, merging allOf fragments and unwrapping the
@@ -998,6 +1158,8 @@ def _param_line(p: dict) -> str:
     description and example. Every optional param says 'optional' out loud — encoding optional as
     the *absence* of a marker reads to a small model as 'listed, therefore needed'."""
     bits = [p["in"], p["type"] or "?", "required" if p["required"] else "optional"]
+    if parameter_format(p):
+        bits.append(f"format={parameter_format(p)}")
     if p.get("deprecated"):
         bits.append("DEPRECATED")
     if p.get("default") is not None:
@@ -1015,7 +1177,14 @@ def _param_line(p: dict) -> str:
     ex = f" [example: {p['example']}]" if p.get("example") is not None else ""
     return head + desc + ex
 
-def endpoint_listing(endpoints, field_limit: int = 15, param_detail: bool = False) -> str:
+def endpoint_listing(
+    endpoints,
+    field_limit: int = 15,
+    param_detail: bool = False,
+    include_notes: bool = False,
+    include_response_tree: bool = True,
+    include_request_tree: bool = False,
+) -> str:
     """One grounded block per endpoint: method, path, description, documented top-level response
     fields, parameters, required body fields and OAuth scopes — so the describe/discovery routes can
     answer 'what does it return' / 'is this required' / 'what scopes' from real spec data instead of
@@ -1029,8 +1198,9 @@ def endpoint_listing(endpoints, field_limit: int = 15, param_detail: bool = Fals
         # The flat line above is only the TOP level. Nested objects/arrays carry the fields users
         # actually ask about ("what's inside `collection`"), so the full tree goes in too — a
         # bigger budget when one endpoint is in focus, a tight per-endpoint one when several are.
-        tree = response_tree(e.method, e.path,
-                             TREE_BUDGET_SINGLE if param_detail else TREE_BUDGET_MULTI)
+        tree = (response_tree(e.method, e.path,
+                              TREE_BUDGET_SINGLE if param_detail else TREE_BUDGET_MULTI)
+                if include_response_tree else "")
         params = endpoint_params(e.method, e.path)
         pnames = [f"{p['name']} ({p['in']}, {'required' if p['required'] else 'optional'})"
                   for p in params]
@@ -1071,15 +1241,25 @@ def endpoint_listing(endpoints, field_limit: int = 15, param_detail: bool = Fals
         if tree:
             lines.append("full response shape (all nested levels):")
             lines.append(tree)
-        if param_detail:
-            rtree = request_tree(e.method, e.path)
+        if param_detail or include_request_tree:
+            rtree = request_tree(
+                e.method,
+                e.path,
+                TREE_BUDGET_SINGLE if param_detail else TREE_BUDGET_MULTI,
+            )
             if rtree:
                 lines.append("full request-body shape (all nested levels):")
                 lines.append(rtree)
-        if param_detail:
+        if param_detail or include_notes:
             notes = (ENDPOINT_SCHEMAS.get((e.method.upper(), e.path)) or {}).get("notes")
             if notes:
-                lines.append(f"notes from the docs: {notes}")
+                # Multi-candidate discovery needs operation semantics ("creates a new booking") but
+                # cannot afford eight full prose blocks in an 8k context. Single-endpoint detail keeps
+                # the existing full captured note; discovery gets a compact, explicitly documented one.
+                shown_notes = notes if param_detail or len(notes) <= 260 else (
+                    notes[:260].rstrip() + " ... [endpoint notes truncated]"
+                )
+                lines.append(f"notes from the docs: {shown_notes}")
             if params:
                 lines.append("parameters:")
                 lines.extend(_param_line(p) for p in params)
@@ -1176,12 +1356,20 @@ def verify_endpoint_mentions(answer: str, spec: "ApiSpec") -> str:
     lines.append("      Treat those parts of the answer as unreliable; the rest came from the spec.")
     return "\n".join(lines)
 
+def grounded_answer_text(prompt: str, spec: "ApiSpec") -> tuple[str, str]:
+    """Return a grounded answer and any endpoint-verification warning.
+
+    Keeping this separate from terminal rendering lets the Streamlit UI use the exact same
+    grounding check without redirecting stdout or scraping console text.
+    """
+    answer = llm.invoke(_fit_prompt(prompt)).content
+    return answer, verify_endpoint_mentions(answer, spec)
+
 def grounded_answer(prompt: str, spec: "ApiSpec") -> None:
     """Run a grounded prompt and print the answer, then verify the endpoints it named. Every
     spec-answering route goes through here so the check can't be forgotten at one of them."""
-    answer = llm.invoke(_fit_prompt(prompt)).content
+    answer, warning = grounded_answer_text(prompt, spec)
     print(answer)
-    warning = verify_endpoint_mentions(answer, spec)
     if warning:
         print(warning)
 
@@ -1256,7 +1444,11 @@ def parse_openapi(spec_source: str) -> ApiSpec:
                 "response": _op_response_schema(op),
                 "scopes": scopes,
                 "auth_schemes": auth_schemes,
+                # An explicit empty security array means this operation is intentionally public,
+                # even when the rest of the API has document-level authentication.
+                "security_explicit_none": op.get("security") == [],
                 "params": params,
+                "param_any_of": _parameter_any_of_groups(prose, params),
                 "notes": notes,
                 "content_type": media,
                 "deprecated": bool(op.get("deprecated", False)),
@@ -1371,19 +1563,30 @@ def _spec_ancestors(url: str) -> list[str]:
             out.append(urlunparse(trimmed))
     return list(reversed(out))                                # innermost (most specific) spec first
 
-def find_openapi_spec(docs_url: str) -> str | None:
+def find_openapi_spec(
+    docs_url: str,
+    progress: Callable[[int, str], None] | None = None,
+) -> str | None:
     """Locate an OpenAPI/Swagger spec for a docs site. Returns its URL, or None."""
+    report = progress or (lambda _percent, _message: None)
     # 0. The URL itself might already be a spec
+    report(10, "Checking whether the supplied source is an OpenAPI document")
     if _is_openapi(docs_url):
+        report(55, "The supplied source is a valid OpenAPI document")
         return docs_url
 
     # 0.5. ...or it may point INTO one (a portal's "export this model" link). Walk up to the spec.
-    for ancestor in _spec_ancestors(docs_url):
+    ancestors = _spec_ancestors(docs_url)
+    for index, ancestor in enumerate(ancestors):
+        report(15 + int(15 * (index + 1) / max(len(ancestors), 1)),
+               "Checking whether the source points inside an OpenAPI document")
         if _is_openapi(ancestor):
             print(f"[ok] That URL points into a spec, not at an endpoint reference - walked up to it.")
+            report(55, "Found the parent OpenAPI document")
             return ancestor
 
     # 1. Links on the docs page that look like a spec
+    report(32, "Inspecting documentation links for an OpenAPI document")
     try:
         _, links = fetch_text(docs_url)
     except requests.RequestException:
@@ -1399,25 +1602,46 @@ def find_openapi_spec(docs_url: str) -> str | None:
     candidates += [root + p for p in well_known]
 
     # 3. First candidate that actually parses as a spec wins
-    for url in dict.fromkeys(candidates):        # dedupe, keep order
+    candidates = list(dict.fromkeys(candidates))  # dedupe, keep order
+    for index, url in enumerate(candidates):
+        report(35 + int(20 * (index + 1) / max(len(candidates), 1)),
+               f"Validating OpenAPI candidate {index + 1} of {len(candidates)}")
         if _is_openapi(url):
+            report(55, "Found a valid OpenAPI document")
             return url
+    report(55, "No machine-readable OpenAPI document was found")
     return None
 
-def onboard(url: str) -> ApiSpec:
+def onboard(
+    url: str,
+    progress: Callable[[int, str], None] | None = None,
+) -> ApiSpec:
     """OpenAPI-first: clean parse if a spec exists, else fall back to the scraper."""
     global _SPEC_ROOT, SPEC_PROVENANCE
+    report = progress or (lambda _percent, _message: None)
+    report(2, "Starting API onboarding")
     ENDPOINT_SCHEMAS.clear()   # drop any previous spec's schemas; parse_openapi repopulates
     _SPEC_ROOT = {}            # ...and its $ref root, so a scraped fallback can't audit stale refs
     SPEC_PROVENANCE = ""
-    spec_url = find_openapi_spec(url)
+    spec_url = find_openapi_spec(url, progress=report)
     if spec_url:
         print(f"[ok] Found OpenAPI spec: {spec_url} - using clean parse.")
         SPEC_PROVENANCE = "openapi"
-        return parse_openapi(spec_url)
+        report(65, "Parsing paths, authentication, parameters, and schemas")
+        spec = parse_openapi(spec_url)
+        report(92, f"Parsed {len(spec.endpoints)} documented endpoints")
+        report(100, "Onboarding complete")
+        return spec
     print("[--] No OpenAPI spec found - falling back to doc scraping.")
     SPEC_PROVENANCE = "scraped"
-    return extract_from_pages(crawl(url))
+    report(62, "Crawling documentation pages")
+    pages = crawl(url)
+    report(78, f"Read {len(pages)} documentation page(s)")
+    report(84, "Extracting endpoints from documented method/path evidence")
+    spec = extract_from_pages(pages)
+    report(96, f"Extracted {len(spec.endpoints)} endpoint claim(s) from prose")
+    report(100, "Onboarding complete")
+    return spec
 
 def _onboard_target(text: str) -> str | None:
     """Deterministic routing: return an onboarding source (URL or local spec path) if the input
@@ -1504,7 +1728,7 @@ def _query_methods(query: str) -> tuple[list[str], bool]:
     """Infer the HTTP method(s) a query implies. Returns (methods, explicit): `explicit` is True when
     the user literally typed a method token (GET/POST/...), which callers may HARD-filter on; a
     verb-implied method (from _VERB_METHODS) is only a soft hint and must not hard-exclude."""
-    q = query.lower()
+    q = _expand_query_aliases(query).lower()
     explicit = [m for m in _CRUD_METHODS if re.search(rf"\b{m.lower()}\b", q)]
     if explicit:
         return explicit, True
@@ -1519,7 +1743,7 @@ def _exact_path_matches(spec: ApiSpec, query: str) -> list[Endpoint]:
     most specific path. [] if no path was named. This is the high-confidence 'the user named THIS
     endpoint' signal, shared by _find_endpoints and _named_endpoint so a fuzzy keyword hit can never
     masquerade as an explicit name (which would wrongly pre-empt semantic discovery)."""
-    q = query.lower()
+    q = _expand_query_aliases(query).lower()
     # Exact path named in the text, e.g. "GET /meetings/{meetingId}/recordings/analytics_summary".
     exact = [e for e in spec.endpoints if e.path.lower() in q]
     if not exact:
@@ -1551,7 +1775,7 @@ def _find_endpoints(spec: ApiSpec, query: str, limit: int = 5) -> list[Endpoint]
     #    on substrings so "recording"/"analytics" hit "recordings"/"analytics_summary". A method the
     #    text implies (create->POST, "update"->PATCH/PUT) boosts matching endpoints so the CRUD verb —
     #    which lives in the method, not the path — breaks otherwise-tied segment scores.
-    q = query.lower()
+    q = _expand_query_aliases(query).lower()
     methods, _ = _query_methods(query)
     qwords = [w for w in re.findall(r"[a-z_]+", q) if len(w) >= 4]
     def sig(path: str) -> list[str]:
@@ -1685,15 +1909,20 @@ def run_grounded_call(e: Endpoint, base_url: str) -> None:
     # 4. Auth placement comes from the SPEC, not from a guess. An `apiKey in query` scheme has to go
     #    into the URL, so this is resolved before the URL is assembled.
     schemes = endpoint_auth_schemes(e.method, e.path)
-    kind, cred_name, template = _credential_placement(schemes)
-    if not schemes:
-        print("     (the spec documents no auth for this endpoint - assuming a bearer token)")
-    else:
+    kind = cred_name = template = ""
+    if schemes:
         print(f"     auth: {auth_instructions(e.method, e.path)}")
+        try:
+            kind, cred_name, template = _credential_placement(schemes)
+        except ValueError as exc:
+            print(f"  [!] {exc} Refusing to guess; call cancelled.")
+            return
+    else:
+        print("     (the spec documents no authentication for this endpoint)")
 
     # 5. Get a token for the host if we don't already have one (never shown to the model).
     probe_host = urlparse(base_url).netloc
-    if probe_host and probe_host not in SECRETS:
+    if schemes and probe_host and probe_host not in SECRETS:
         label = (f"{cred_name} header" if kind == "header" and cred_name != "Authorization"
                  else f"{template.split()[0] if ' ' in template else 'API'} token")
         try:
@@ -1705,12 +1934,17 @@ def run_grounded_call(e: Endpoint, base_url: str) -> None:
             SECRETS[probe_host] = tok
 
     headers = {}
-    if probe_host in SECRETS:
+    cookies = {}
+    if schemes and probe_host in SECRETS:
         # Placeholder only; the real token is substituted inside _do_http_call, at HTTP time.
         if kind == "query":
             query[cred_name] = "{{TOKEN}}"
+        elif kind == "cookie":
+            cookies[cred_name] = "{{TOKEN}}"
         else:
             headers[cred_name] = template
+    if cookies:
+        headers["Cookie"] = "; ".join(f"{key}={value}" for key, value in cookies.items())
 
     # 6. Assemble the full URL (after any query-placed credential is in `query`).
     if not base_url:

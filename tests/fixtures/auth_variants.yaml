@@ -1,0 +1,107 @@
+openapi: 3.0.3
+info:
+  title: Authentication Variants Test API
+  version: 1.0.0
+servers:
+  - url: https://api.example.test/v1
+components:
+  securitySchemes:
+    HeaderKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    QueryKey:
+      type: apiKey
+      in: query
+      name: api_key
+    CookieKey:
+      type: apiKey
+      in: cookie
+      name: session_key
+    BasicAuth:
+      type: http
+      scheme: basic
+    DigestAuth:
+      type: http
+      scheme: digest
+security:
+  - HeaderKey: []
+paths:
+  /inherited:
+    get:
+      summary: Uses document-level header authentication
+      responses:
+        "200":
+          description: OK
+  /public:
+    get:
+      summary: Explicitly public operation
+      security: []
+      responses:
+        "200":
+          description: OK
+  /query-key:
+    get:
+      summary: Uses a query API key
+      security:
+        - QueryKey: []
+      parameters:
+        - name: tags
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        "200":
+          description: OK
+  /cookie-key:
+    get:
+      summary: Uses a cookie API key
+      security:
+        - CookieKey: []
+      responses:
+        "200":
+          description: OK
+  /basic:
+    get:
+      summary: Uses HTTP Basic authentication
+      security:
+        - BasicAuth: []
+      responses:
+        "200":
+          description: OK
+  /unsupported:
+    get:
+      summary: Uses an unsupported HTTP authentication scheme
+      security:
+        - DigestAuth: []
+      responses:
+        "200":
+          description: OK
+  /choice:
+    post:
+      summary: Accepts either a person or a team target
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [person_id]
+                  properties:
+                    person_id:
+                      type: string
+                - type: object
+                  required: [team_id]
+                  properties:
+                    team_id:
+                      type: string
+      responses:
+        "201":
+          description: Created

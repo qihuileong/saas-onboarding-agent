@@ -5,12 +5,19 @@ it explores the docs, extracts a **structured API spec** (base URL, auth method,
 and can make **real, grounded API calls** on the user's behalf. Runs fully local via Ollama.
 
 ## How to run
+- `uv run streamlit run streamlit_app.py` — the browser UI: onboard with staged progress, chat
+  against the spec, inspect endpoints, prepare/confirm real calls, and view/download redacted logs.
 - `uv run python main.py --url <docs-url>` — one-shot prose summary of an API's docs.
 - `uv run python tests/test_call_fidelity.py [spec ...]` — audit that the parser keeps everything a
   real HTTP call needs (auth placement, bodies, media types, constraints). Defaults to
   `tests/fixtures/`; non-zero exit on a HIGH finding.
 - `uv run python tests/test_onboard_evidence.py [--live]` — the onboarding guards: the evidence gate,
   spec-ancestor walk-up, and scraped-vs-parsed coverage wording. Network-free without `--live`.
+- `uv run python tests/test_ui_service.py` and
+  `uv run python tests/test_streamlit_workflows.py` — network-free service and browser-journey
+  regressions, including auth variants, credential lifecycle/redaction, reruns, and call handoff.
+- `uv run python tests/test_live_agent_journeys.py` — local Ollama embeddings + model answers against
+  the pinned Calendly spec; no third-party API call or credential.
 - `uv run python agent.py` — the interactive agent (the main program). Type a docs URL **or a local
   spec path** (`C:\...\openapi.json`, `./spec.yaml`, `file://...`; JSON or YAML), ask it to
   read/describe/find/test endpoints. Commands: `extract` (dump structured spec), `end session` (quit).
@@ -18,6 +25,21 @@ and can make **real, grounded API calls** on the user's behalf. Runs fully local
 - Requires a local **Ollama** server with the models pulled (see below).
 
 ## Key files
+- **streamlit_app.py** — browser UI and Streamlit session state. It deliberately uses a two-step
+  prepare/confirm flow for real calls; credentials are session-scoped by API host + auth scheme, so
+  they follow endpoint changes without being shared across browser sessions or written to disk.
+  The sidebar credential manager is the single edit/replace/clear surface; Chat and API Call only
+  check that shared store and direct the user there when the required scheme is missing.
+  Calls selected from Chat append their results to Chat. Failed responses in that linked flow are
+  reviewed against the selected endpoint's schema and masked request, and the local model drafts a
+  corrected next request; the user must still prepare, inspect, and explicitly send it. Calls
+  prepared directly in API Call remain standalone unless the user explicitly selects **Ask agent
+  to diagnose this response** after a failure.
+  The Debug & Traces tab separates transcript, detailed traces, and event log, with per-trace and
+  filtered-trace downloads in addition to the complete local debug bundle.
+- **ui_service.py** — UI-safe reusable workflows: deterministic chat routing, call preparation and
+  execution, Langfuse-shaped trace spans, credential-safe previews, and redaction. It contains no
+  Streamlit imports.
 - **agent.py** — the heart of the project. A LangGraph ReAct agent (`create_react_agent`) with
   three tools: `fetch_url` (read a docs page), `make_api_call` (real HTTP request),
   `authorize` (human-in-the-loop credential prompt). Also holds the structured-extraction pipeline
@@ -40,6 +62,37 @@ and can make **real, grounded API calls** on the user's behalf. Runs fully local
 - Do **not** pull the 14b models — the machine has 8GB VRAM and won't fit them.
 
 ## Patterns that matter here
+- **Event logs and detailed traces are different layers.** Event logs record concise
+  INFO/WARNING/ERROR events and exclude response bodies. Local traces capture full chat turns,
+  routing, retrieval candidates, LLM prompt/output, timings, masked HTTP requests, and API results;
+  the UI can copy/download a single trace, export only the current filtered trace set, or export the
+  entire session with its transcript. Credentials are redacted from both, but trace bundles can
+  contain API/user data and must be reviewed before sharing. Langfuse can later persist/evaluate the
+  same spans; it does not replace application progress/error logs.
+- **Response truncation is a model-context boundary, not a browser boundary.** Tool/CLI calls keep
+  `_do_http_call`'s 500-character default so a response cannot flood the local model context. The
+  Streamlit call builder passes `response_limit=None`: its result stays local, must remain valid JSON
+  for pretty rendering, and may be inspected in full. A failed-call review sends only the masked
+  request plus a redacted, bounded response excerpt to the local model; the full result remains in
+  Pretty/Raw response and the local trace. Do not reapply the tool excerpt limit to UI calls.
+- **UI progress must reflect real stages.** `onboard(..., progress=callback)` and
+  `find_openapi_spec(..., progress=callback)` report discovery, validation, parsing/scraping, and
+  completion. Do not fake a timer-based progress bar; long embedding/LLM stages report before and
+  after the blocking operation.
+- **A Streamlit rerun must restore the whole parsed runtime, not only `ApiSpec`.** Endpoint names live
+  in `ApiSpec`, but request/response schemas, auth placement, `$ref` roots, and the RAG index live in
+  `agent.py` globals. Hot reload can preserve `st.session_state.spec` while reinitializing those
+  globals, producing plausible falsehoods such as `POST /one_off_event_types [no request body]`.
+  `agent_runtime` snapshots and `_restore_agent()` rehydrate them before every UI render.
+- **Streamlit can retain stale imported modules during a hot rerun.** `ui_service.API_VERSION` and
+  the guarded reload at the top of `streamlit_app.py` keep a newer page from calling an older
+  service signature. API-call preparation catches unexpected exceptions locally so one broken tab
+  never replaces the entire app with Streamlit's traceback page.
+- **Spec-grounded is weaker than retrieval-grounded.** `verify_endpoint_mentions()` proves that a
+  named endpoint exists somewhere in the full spec. During RAG discovery, the model must also be
+  checked against the candidate block it actually received; otherwise a real but unretrieved
+  endpoint is prior-knowledge leakage. `ui_service.verify_candidate_mentions()` enforces that
+  narrower evidence boundary.
 - **Report coverage, because extraction fails silently.** Every extraction bug here has failed
   without raising: an unresolved `$ref` renders as `{}`, a `$ref` parameter gets skipped, scopes in
   prose come back `[]`. Nothing errors — the agent just describes a smaller, emptier API than the
@@ -134,16 +187,20 @@ and can make **real, grounded API calls** on the user's behalf. Runs fully local
     `POST /pet` needs no payload; and all 20 endpoints appeared to return nothing.
   - **The credential's type is not its location.** `apiKey` is unsendable until you also know
     `in: header` and `name: api_key`. `AUTH_SCHEMES` + `_credential_placement` parse that, and
-    `run_grounded_call` builds the header (or query param) from it instead of hardcoding
-    `Authorization: Bearer`. A query-placed key is substituted in `_do_http_call`, which matches the
-    percent-encoded placeholder too because `urlencode` mangles it on the way in.
+    `run_grounded_call` builds the header, query parameter, or cookie from it instead of hardcoding
+    `Authorization: Bearer`. `credential_options` drives scheme-specific UI labels for PAT/bearer,
+    OAuth/OpenID access tokens, API keys, and Basic credentials. Missing or unsupported placement
+    must stop request preparation; never guess Bearer. A query-placed key is substituted in
+    `_do_http_call`, which matches the percent-encoded placeholder too because `urlencode` mangles
+    it on the way in.
   Also carried now, each because its absence turns a documented rejection into a mystery: request
   media type (a JSON body sent to an `application/octet-stream` endpoint fails on content type, so
   `run_grounded_call` refuses rather than firing), `deprecated`, param constraints (`min`/`max`/
   `pattern` — what a 422 is made of), array `style`/`explode` (`?t=a,b` vs `?t=a&t=b`), `readOnly`
-  (must NOT be sent), and **nested** required fields — `request_required()` is top-level by
-  contract, so `_schema_tree` marks `required` per object, which is the only place
-  `invitee.email` shows up.
+  (must NOT be sent), prose-only cross-parameter requirements such as "either `organization` or
+  `user` is required", and **nested** required fields — `request_required()` is top-level by
+  contract, so `_schema_tree` marks `required` per object, which is the only place `invitee.email`
+  shows up.
 - **Distinguish "absent" from "empty".** `request_required` returns `None` (no body) vs `[]` (body,
   nothing required); `_op_security` returns scopes *and* scheme names, so a spec that names
   `{oauth2: []}` can still answer "oauth2 authenticates this" instead of "no auth documented".
