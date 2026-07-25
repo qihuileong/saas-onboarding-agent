@@ -1109,6 +1109,28 @@ def _norm_path(p: str, base_url: str = "") -> str:
     p = p.rstrip(".,;:!?)]`*_\"'")
     return p.rstrip("/") or "/"
 
+def _path_template_matches(template: str, candidate: str) -> bool:
+    """True when a concrete candidate path fits a documented template path.
+
+    `GET /event_types/123e...` is a real mention of `GET /event_types/{uuid}`. The output checker
+    should flag invented endpoints, not legitimate examples where the model filled a path param.
+    """
+    template = _norm_path(template)
+    candidate = _norm_path(candidate)
+    if template == candidate:
+        return True
+    tparts = [s for s in template.strip("/").split("/") if s]
+    cparts = [s for s in candidate.strip("/").split("/") if s]
+    if len(tparts) != len(cparts):
+        return False
+    return all(
+        t == c or (
+            t == "{}"
+            and (_looks_like_id(c) or bool(re.fullmatch(r"(?=.*\d)[A-Za-z0-9_-]{8,}", c)))
+        )
+        for t, c in zip(tparts, cparts)
+    )
+
 def verify_endpoint_mentions(answer: str, spec: "ApiSpec") -> str:
     """Check every endpoint the model NAMED against the spec, and report any that don't exist.
 
@@ -1131,7 +1153,8 @@ def verify_endpoint_mentions(answer: str, spec: "ApiSpec") -> str:
         if np == "/" or (method.upper(), np) in seen:
             continue
         seen.add((method.upper(), np))
-        methods = real.get(np)
+        matching_paths = [path for path in real if _path_template_matches(path, np)]
+        methods = set().union(*(real[path] for path in matching_paths)) if matching_paths else None
         if methods is None or method.upper() not in methods:
             bad.append((method.upper(), np, methods))
     if not bad:
@@ -1974,7 +1997,11 @@ if __name__ == "__main__":
                                 "the user which one(s) do what they asked - and if they're after a specific "
                                 "value, which endpoint's response field holds it - using ONLY these "
                                 "candidates and their listed fields. If none fit, say so plainly and note "
-                                "what these cover. Nested response shapes are given in full where "
+                                "what these cover. Do not mention, imply, or recommend a plausible "
+                                "endpoint that is not in the candidate list; if the API would need a "
+                                "missing endpoint such as bookings, scheduling, checkout, or creation "
+                                "of another resource, say that this spec does not document one. Nested "
+                                "response shapes are given in full where "
                                 "available - use them when the user asks for a field inside an "
                                 "object or array. If any block is marked [!] TRUNCATED, say so and "
                                 "point the user at the API's own docs. "

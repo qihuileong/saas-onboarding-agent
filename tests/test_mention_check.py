@@ -39,6 +39,8 @@ CLEAN = [
     "Call POST https://api.calendly.com/one_off_event_types to make a one-off type.",
     "The endpoint GET /users/me returns the current user.",
     "Templating differs but means the same slot: GET /event_types/{id}",
+    "Concrete UUID examples should match templates: GET /event_types/123e4567-e89b-12d3-a456-426614174000",
+    "Full concrete URLs should match templates: GET https://api.calendly.com/event_types/123e4567-e89b-12d3-a456-426614174000",
     "Trailing punctuation should not break it: see GET /groups, and POST /shares.",
     "Prose that names no path: use GET on the events collection.",
 ]
