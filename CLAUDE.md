@@ -9,6 +9,8 @@ and can make **real, grounded API calls** on the user's behalf. Runs fully local
 - `uv run python tests/test_call_fidelity.py [spec ...]` — audit that the parser keeps everything a
   real HTTP call needs (auth placement, bodies, media types, constraints). Defaults to
   `tests/fixtures/`; non-zero exit on a HIGH finding.
+- `uv run python tests/test_onboard_evidence.py [--live]` — the onboarding guards: the evidence gate,
+  spec-ancestor walk-up, and scraped-vs-parsed coverage wording. Network-free without `--live`.
 - `uv run python agent.py` — the interactive agent (the main program). Type a docs URL **or a local
   spec path** (`C:\...\openapi.json`, `./spec.yaml`, `file://...`; JSON or YAML), ask it to
   read/describe/find/test endpoints. Commands: `extract` (dump structured spec), `end session` (quit).
@@ -44,9 +46,31 @@ and can make **real, grounded API calls** on the user's behalf. Runs fully local
   real one, and you find out several turns later via a confidently wrong answer. `spec_coverage()`
   prints what the parse actually YIELDED right after onboarding (endpoints, how many carry
   auth/params/schemas, and a `$ref` audit: resolved / broken / remote), and flags an anomalous zero
-  with the usual cause. Treat a zero in that report as a parser bug until proven otherwise.
-- **Structured output beats fabrication.** Extraction uses a Pydantic schema (`ApiSpec`/`Endpoint`)
-  via `llm.with_structured_output(...)`. This is what stopped the model inventing endpoints — keep it.
+  with the usual cause. Treat a zero in that report as a parser bug until proven otherwise —
+  **unless the spec was scraped**, where the zeros are structural and mean something else entirely
+  (next bullet but two).
+- **Structured output beats fabrication — of FIELDS, not of EXISTENCE.** Extraction uses a Pydantic
+  schema (`ApiSpec`/`Endpoint`) via `llm.with_structured_output(...)`; keep it. But know its limit:
+  it constrains the shape of the answer, never whether there was anything to answer. Handed a
+  Stoplight *model export* (`.../openapi.yaml/components/schemas/Event` — a bare JSON-Schema
+  fragment, 24KB with no `paths:` and **zero** HTTP verbs), it returned 12 confident endpoints built
+  out of nouns in the schema: `POST /google_conference`, `GET /conferences/gotomeeting/{conference_id}`.
+  Every noun was real (`gotomeeting` ×7 in the doc); every **method** and every **path parameter**
+  was invented. `_clean` can't help — the output is schema-valid. So the guard has to sit upstream.
+- **Check the EVIDENCE before the model sees it.** `_has_endpoint_evidence` requires a literal
+  `METHOD /path` pair (`_METHOD_PATH_RE`; tolerates markdown between the two — `**POST** \`/invitees\``
+  is one pair — but bounded and word-char-free, so "the POST body described in /docs" can't bridge
+  it). `extract_from_pages` skips chunks without it and **raises** if none qualify, rather than
+  returning a spec made of guesses. Conservative in the safe direction on purpose: a miss refuses to
+  onboard (loud, recoverable), a false pass fabricates silently and reads as authoritative for the
+  rest of the session.
+- **A scraped spec must announce that it is scraped.** `SPEC_PROVENANCE` ("openapi" | "scraped") is
+  set by `onboard`. It matters because the scrape path *never* populates params/schemas/scopes, so
+  it always reports `0/N` across the board — and the parsed-path hint ("the spec may document them
+  in prose this parser doesn't recognise") then sends you hunting a parser bug that doesn't exist,
+  while implying the endpoints themselves are solid and merely under-annotated. They aren't.
+  `spec_coverage` says `SCRAPED, NOT PARSED`, that the zeros are expected, and that nothing is
+  corroborated; it also drops the `$ref` tally, which is vacuous when `_SPEC_ROOT` is `{}`.
 - **Grounding guards.** `make_api_call` refuses paths whose segments never appeared in fetched docs
   (`DOC_CORPUS`); the system prompt forbids inventing endpoints or fabricating tool results.
 - **Check the model's OUTPUT, not just its input.** The grounding prompts forbid inventing
@@ -59,12 +83,21 @@ and can make **real, grounded API calls** on the user's behalf. Runs fully local
   collapse templates BEFORE trimming, or a trailing `}` is eaten and nothing matches) and checks it
   against the spec, printing what's real on that path when it isn't. Every spec-answering route
   goes through `grounded_answer()` so the check can't be forgotten at one of the three call sites.
+  **Its blind spot:** it validates answers *against the spec*, so it is useless when the spec itself
+  is the fabrication — a scraped `POST /scheduled_events` gets certified as real. Output-side
+  grounding assumes the spec is ground truth; that assumption is what the evidence gate protects.
 - **Secrets never reach the model.** Tokens live in the module-level `SECRETS` dict (host -> token),
   never in `messages`. The model uses the literal placeholder `{{TOKEN}}`; real values are substituted
   only inside `make_api_call`. `authorize` obtains tokens via LangGraph `interrupt` (human in the loop).
 - **OpenAPI-first.** If a machine-readable spec exists, parse it deterministically (no LLM);
   only fall back to LLM scraping when there's no spec. `parse_openapi`/`_load_spec` accept an
   http(s) URL **or a local file** (`file://` or a bare path), JSON **or YAML** (`yaml.safe_load`).
+  A URL may also point *into* a spec rather than at one: doc portals export a piece by appending a
+  pointer to the spec's own path (`.../calendly-api/openapi.yaml/components/schemas/Event`).
+  `_spec_ancestors` truncates at any `.json`/`.yaml`/`.yml` path segment that has more path after it,
+  innermost first, and `find_openapi_spec` tries those at step 0.5 — purely structural, so it covers
+  any portal with that shape, and `_is_openapi` still validates every candidate. On the URL above
+  that's the difference between 12 fabricated endpoints and the real 61.
 - **`$ref` resolution is not optional.** Specs vary wildly in how much they inline: Zoom's file is
   fully expanded, Calendly's has ~500 `$ref`s. `_deref` resolves same-document pointers lazily
   against `_SPEC_ROOT` (set by `parse_openapi`), and every schema walker (`_example_from_schema`,

@@ -12,10 +12,11 @@ import re
 import os
 import json
 import yaml
+import textwrap
 from pydantic import BaseModel, Field
 from collections import Counter
 from scraper import crawl
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlunparse
 
 SECRETS: dict[str, str] = {}   # host -> token. Never enters `messages`, so the model never sees it.
 DOC_CORPUS: list[str] = []           # all doc text fetched so far (grounding evidence)
@@ -32,6 +33,11 @@ _SPEC_ROOT: dict = {}
 # needs `api_key: <token>`, NOT `Authorization: Bearer <token>`. Sending the wrong one is a
 # guaranteed 401 that looks like a bad credential rather than a bad request.
 AUTH_SCHEMES: dict[str, dict] = {}
+# How the current spec was obtained: "openapi" (deterministic parse of a spec document) or "scraped"
+# (an LLM reading prose). It changes what a zero in the coverage report MEANS - the scrape path never
+# populates params/schemas/scopes at all, so reporting "0/12 parameters" there as a possible parser
+# gap points at the wrong thing entirely. See spec_coverage().
+SPEC_PROVENANCE: str = ""
 SKIP_SEGMENTS = {"v1", "v2", "v3", "api", "rest"}   # version/prefix noise, not "real" path words
 
 class Endpoint(BaseModel):
@@ -282,11 +288,42 @@ def _clean(spec: ApiSpec) -> ApiSpec:
     spec.endpoints = kept
     return spec
 
+# A block of documentation containing no `METHOD /path` pair anywhere cannot honestly yield an
+# endpoint - whatever the extractor returns for it is invented from the nouns on the page. Check the
+# EVIDENCE before the LLM ever sees the text: a Stoplight `components/schemas/Event` export (a data
+# model - no `paths:`, not one HTTP verb in 24KB) produced 12 confident endpoints, because the schema
+# happened to mention `google_conference`, `gotomeeting`, `webex_conference`. Every verb and every
+# path parameter was fabricated. Structured output constrains the SHAPE of the answer, never whether
+# there was anything to answer - so the guard has to sit upstream of the model, not on its output.
+_METHOD_PATH_RE = re.compile(
+    r"\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b"         # the verb
+    r"(?:[\s*`_|:.\-]){0,6}"                                  # markup/punctuation between the two -
+                                                              # `**POST** \`/invitees\`` is one pair.
+                                                              # Bounded, and no word chars, so "the
+                                                              # POST body described in /docs" can't
+                                                              # bridge the gap and match.
+    r"(?:https?://[^\s\"'<>]+)?"                              # an optional absolute host
+    r"/[A-Za-z0-9_\-{]",                                      # ...followed by an actual path
+    re.I)
+
+def _has_endpoint_evidence(text: str) -> bool:
+    """True if `text` actually SHOWS a method+path pair. Conservative in the safe direction: a miss
+    refuses to onboard (loud, recoverable, the user can point at a real reference page), whereas a
+    false pass invents endpoints silently and they read as authoritative for the rest of the session."""
+    return bool(_METHOD_PATH_RE.search(text))
+
 def extract_from_pages(pages) -> ApiSpec:
-    """pages: [(url, text)]. Chunk each page, extract per chunk, merge & dedup endpoints."""
+    """pages: [(url, text)]. Chunk each page, extract per chunk, merge & dedup endpoints.
+    Chunks showing no method+path evidence are skipped before the LLM sees them; if NONE of them
+    qualify, raise instead of returning a spec built entirely out of guesses."""
     base_urls, auth_methods, seen, endpoints = [], [], set(), []
+    total = skipped = 0
     for url, text in pages:
         for chunk in _chunks(text):
+            total += 1
+            if not _has_endpoint_evidence(chunk):
+                skipped += 1
+                continue
             spec = extractor.invoke(
                 "From the API reference text below, extract ONLY documented request endpoints — "
 "each must be a callable operation with an HTTP method and a path, like a section "
@@ -304,6 +341,15 @@ def extract_from_pages(pages) -> ApiSpec:
                 if key not in seen:
                     seen.add(key)
                     endpoints.append(ep)
+    if total and skipped == total:
+        raise ValueError(
+            f"none of the {total} text block(s) fetched contain a `METHOD /path` pair - this page "
+            f"documents something other than callable endpoints (a data model, a changelog, a "
+            f"landing page). Refusing to extract, because anything returned would be invented from "
+            f"the nouns on the page. Point me at the API reference itself, or at its OpenAPI spec")
+    if skipped:
+        print(f"[--] skipped {skipped}/{total} text block(s) with no METHOD /path evidence "
+              f"- extracted from the remaining {total - skipped}.")
     base = Counter(base_urls).most_common(1)[0][0] if base_urls else ""
     auth = Counter(auth_methods).most_common(1)[0][0] if auth_methods else ""
     return _clean(ApiSpec(base_url=base, auth_method=auth, endpoints=endpoints))
@@ -1241,25 +1287,40 @@ def spec_coverage(spec: ApiSpec) -> str:
     body = have(lambda e: (ENDPOINT_SCHEMAS.get((e.method, e.path)) or {}).get("request"))
     refs = _ref_audit(_SPEC_ROOT)
 
-    lines = [f"  endpoints        {n}",
+    scraped = SPEC_PROVENANCE == "scraped"
+    lines = [f"  endpoints        {n}" + ("   (scraped from prose - see below)" if scraped else ""),
              f"  auth documented  {authed}/{n}   (granular scopes: {scoped}/{n})",
              f"  parameters       {parms}/{n}",
              f"  request schema   {body}/{n}",
-             f"  response schema  {resp}/{n}",
-             f"  $refs            {refs['resolved']} resolved, {refs['broken']} broken, "
-             f"{refs['remote']} remote (not followed)"]
+             f"  response schema  {resp}/{n}"]
+    if not scraped:   # a scraped spec has no document behind it, so a $ref tally of all zeros is
+        lines.append(f"  $refs            {refs['resolved']} resolved, {refs['broken']} broken, "
+                     f"{refs['remote']} remote (not followed)")   # vacuous, not reassuring
     warn = []
-    if not authed:
+    if scraped:
+        # The zeros above are STRUCTURAL on this path, not a parser gap - saying "the parser may not
+        # recognise this prose" would send you hunting for a bug that isn't there, and worse, implies
+        # the endpoints themselves are solid and merely under-annotated. They aren't: they're an LLM's
+        # reading of a page, with nothing to check them against.
+        warn.append("SCRAPED, NOT PARSED - no machine-readable spec was found, so these endpoints "
+                    "are an LLM's reading of prose. The scrape path does not extract params, "
+                    "schemas or scopes at all, so the zeros above are expected and say nothing "
+                    "about coverage. Nothing here is corroborated by a spec document - treat every "
+                    "endpoint as a claim to verify before calling it.")
+    if not authed and not scraped:
         warn.append("no auth/scopes found - the spec may document them in prose this parser "
                     "doesn't recognise (see _doc_scopes)")
-    if not resp:
+    if not resp and not scraped:
         warn.append("no response schemas - answers about return values will be thin")
     if refs["broken"]:
         warn.append(f"{refs['broken']} $ref(s) point at nothing - those schemas render empty")
     if refs["remote"]:
         warn.append(f"{refs['remote']} $ref(s) point at another file - not followed, so those "
                     "schemas render empty")
-    lines += [f"  [!] {w}" for w in warn]
+    for w in warn:   # wrap — the scraped-spec warning is the most important line in the report and
+        wrapped = textwrap.wrap(w, 84)   # must not scroll off the right edge of a terminal
+        lines.append(f"  [!] {wrapped[0]}")
+        lines += [f"      {cont}" for cont in wrapped[1:]]
     return "\n".join(lines)
 
 def _is_openapi(source: str) -> bool:
@@ -1270,11 +1331,34 @@ def _is_openapi(source: str) -> bool:
         return False
     return isinstance(data, dict) and ("openapi" in data or "swagger" in data)
 
+def _spec_ancestors(url: str) -> list[str]:
+    """Candidate spec URLs formed by truncating `url` at a spec-file segment that has more path
+    hanging off it. Doc portals export a PIECE of a spec by appending a pointer to the spec's own
+    path - Stoplight's model export is
+    `.../calendly-api/openapi.yaml/components/schemas/Event?snapshotType=model`, which serves a bare
+    JSON-Schema fragment: no `paths:`, no HTTP verbs, nothing callable. Truncating at `openapi.yaml`
+    yields the real 47-path Calendly document. Purely structural, so it covers any portal using the
+    same shape, and every candidate is still validated by `_is_openapi` before it's used."""
+    parts = urlparse(url)
+    segs = parts.path.split("/")
+    out = []
+    for i, seg in enumerate(segs[:-1]):                       # :-1 — a trailing spec file is not a
+        if seg.lower().endswith((".json", ".yaml", ".yml")):  # fragment URL, step 0 already tried it
+            trimmed = parts._replace(path="/".join(segs[:i + 1]), query="", fragment="")
+            out.append(urlunparse(trimmed))
+    return list(reversed(out))                                # innermost (most specific) spec first
+
 def find_openapi_spec(docs_url: str) -> str | None:
     """Locate an OpenAPI/Swagger spec for a docs site. Returns its URL, or None."""
     # 0. The URL itself might already be a spec
     if _is_openapi(docs_url):
         return docs_url
+
+    # 0.5. ...or it may point INTO one (a portal's "export this model" link). Walk up to the spec.
+    for ancestor in _spec_ancestors(docs_url):
+        if _is_openapi(ancestor):
+            print(f"[ok] That URL points into a spec, not at an endpoint reference - walked up to it.")
+            return ancestor
 
     # 1. Links on the docs page that look like a spec
     try:
@@ -1299,14 +1383,17 @@ def find_openapi_spec(docs_url: str) -> str | None:
 
 def onboard(url: str) -> ApiSpec:
     """OpenAPI-first: clean parse if a spec exists, else fall back to the scraper."""
-    global _SPEC_ROOT
+    global _SPEC_ROOT, SPEC_PROVENANCE
     ENDPOINT_SCHEMAS.clear()   # drop any previous spec's schemas; parse_openapi repopulates
     _SPEC_ROOT = {}            # ...and its $ref root, so a scraped fallback can't audit stale refs
+    SPEC_PROVENANCE = ""
     spec_url = find_openapi_spec(url)
     if spec_url:
         print(f"[ok] Found OpenAPI spec: {spec_url} - using clean parse.")
+        SPEC_PROVENANCE = "openapi"
         return parse_openapi(spec_url)
     print("[--] No OpenAPI spec found - falling back to doc scraping.")
+    SPEC_PROVENANCE = "scraped"
     return extract_from_pages(crawl(url))
 
 def _onboard_target(text: str) -> str | None:
